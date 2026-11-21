@@ -1,5 +1,5 @@
 # Start the AdaKernel OpenAI-compatible server for Qwen3.8 9B (used by OpenCode as provider "adakernel").
-#   powershell -ExecutionPolicy Bypass -File C:\Users\OmerC\kernel-sanders\scripts\serve.ps1 [-Ctx 32768] [-Port 8090]
+#   powershell -ExecutionPolicy Bypass -File scripts\serve.ps1 [-Ctx 32768] [-Port 8090]
 param(
     [int]$Ctx = 32768,
     [int]$Port = 8090,
