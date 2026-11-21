@@ -1,0 +1,17 @@
+[project]
+name = "qwen-coder-kernel"
+version = "0.1.0"
+description = "Qwen3.5 hybrid (Gated DeltaNet + attention) CUDA runtime with MTP speculative decoding and an OpenAI-compatible server"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy", "jinja2"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["adakernel*"]
