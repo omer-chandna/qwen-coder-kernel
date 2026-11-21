@@ -1,4 +1,8 @@
-# Qwen3.8 9B (qwen35 hybrid) on the AdaKernel qwen35 runtime
+# Qwen3.8 9B on the AdaKernel runtime
+
+The model is Qwen3.8 9B. "qwen35" in this document and in the code (`qwen35_model.cu`, `Qwen35Model`, `ak_q35_*`)
+is the name of its GGUF architecture: Qwen3.8 9B is a fine-tune of Qwen3.5-9B and keeps its hybrid layout. It does
+not refer to the stock `qwen3.5:9b` model, which was not used here.
 
 Machine: RTX 4060 8 GB, Ryzen 5 7600X, Windows 11. Model: Ollama `eriktonon/qwen3.8-uncensored:9b`, blob
 `sha256-c7f6915f…3408` (5.78 GB, Q4_K_M, GGUF architecture `qwen35`, a fine-tune of Qwen3.5-9B). 32 layers: 24 Gated

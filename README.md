@@ -16,7 +16,7 @@
 </p>
 
 <p align="center">
-  <a href="#demo">Demo</a> · <a href="#quickstart">Quickstart</a> · <a href="#numbers">Numbers</a> · <a href="#how-it-works">How it works</a> · <a href="docs/QWEN35_9B.md">Full write-up</a>
+  <a href="#demo">Demo</a> · <a href="#quickstart">Quickstart</a> · <a href="#numbers">Numbers</a> · <a href="#how-it-works">How it works</a> · <a href="docs/QWEN38_9B.md">Full write-up</a>
 </p>
 
 ## Demo
@@ -32,9 +32,14 @@
 
 ## Why
 
-A CUDA runtime for Qwen3.5-architecture GGUF files (`qwen35`: Gated DeltaNet layers with gated attention every fourth
-layer, plus the MTP head), tuned for coding on an 8 GB RTX 4060, with an OpenAI-compatible server so OpenCode (or
-Continue, Aider, ...) can use it as a local provider.
+A CUDA runtime for **Qwen3.8 9B** (`eriktonon/qwen3.8-uncensored:9b` from Ollama), tuned for coding on an 8 GB
+RTX 4060, with an OpenAI-compatible server so OpenCode (or Continue, Aider, ...) can use it as a local provider.
+
+> [!NOTE]
+> **Why the code says "qwen35".** Qwen3.8 9B is a fine-tune of Qwen3.5-9B, so it keeps that model's layout: Gated
+> DeltaNet layers with gated attention every fourth layer, plus the MTP head. Its GGUF file labels that layout
+> `qwen35`, and the runtime is named after it (`qwen35_model.cu`, `Qwen35Model`). The name means the layout, not the
+> model version. The stock `qwen3.5:9b` from Ollama is not what this repo was built or measured on.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\serve.ps1   # http://127.0.0.1:8090/v1
@@ -77,7 +82,7 @@ Three chat requests carrying real source code, 256 generated tokens each, RTX 40
 In a real OpenCode session ("fix two bugs in stats.py, run it"), the 6.6k-token system prompt was read once in 6.3 s;
 each of the following steps started in 0.3-0.55 s and decoded at 82-100 tok/s, for 13.6 s end to end.
 
-Methodology, per-kernel profiles, long-context numbers and next steps are in [docs/QWEN35_9B.md](docs/QWEN35_9B.md).
+Methodology, per-kernel profiles, long-context numbers and next steps are in [docs/QWEN38_9B.md](docs/QWEN38_9B.md).
 
 <img src=".github/readme/divider.svg" width="100%" alt="">
 
@@ -94,14 +99,23 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -Cuda <cuda toolkit r
 The script records the toolkit's `bin` folder in `build/cuda_bin.txt`, and the Python loader uses it to find cudart and
 cuBLAS. Python needs `numpy` and `jinja2`; the tests also need `pytest`.
 
+### Get the model
+
+```powershell
+ollama pull eriktonon/qwen3.8-uncensored:9b
+```
+
+The server reads the weights straight from Ollama's store
+(`~/.ollama/models/blobs/sha256-c7f6915f…3408`, 5.78 GB, Q4_K_M), so Ollama itself does not need to be running.
+
 ### Run with OpenCode
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\serve.ps1            # -Ctx 32768 -Port 8090 -Model <gguf>
 ```
 
-Then pick `adakernel/qwen3.8-9b` in OpenCode. The default model path is the Ollama blob of `qwen3.8-uncensored:9b`;
-pass `-Model` for another qwen35 GGUF.
+Then pick `adakernel/qwen3.8-9b` in OpenCode. To load a different GGUF with the same `qwen35` layout, pass its path
+with `-Model` (only Qwen3.8 9B has been tested).
 
 <details>
 <summary>OpenCode provider entry (<code>~/.config/opencode/opencode.json</code>)</summary>
