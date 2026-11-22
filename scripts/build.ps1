@@ -5,7 +5,8 @@
 param(
     [string]$Cuda = "",
     [string]$CMake = "",
-    [string]$Ninja = ""
+    [string]$Ninja = "",
+    [string]$BuildDir = "build"   # e.g. build-dev while a server holds build\adakernel.dll (load it via ADAKERNEL_DLL)
 )
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
@@ -31,9 +32,9 @@ if (-not $CMake) { $CMake = (Get-Command cmake -ErrorAction SilentlyContinue).So
 if (-not $Ninja) { $Ninja = (Get-Command ninja -ErrorAction SilentlyContinue).Source }
 if (-not $CMake -or -not $Ninja) { throw "cmake / ninja not found; pip install cmake ninja, or pass -CMake and -Ninja." }
 
-$cmd = "`"$vcvars`" && `"$CMake`" -S `"$Root`" -B `"$Root\build`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=`"$CudaRoot\bin\nvcc.exe`" -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_MAKE_PROGRAM=`"$Ninja`" && `"$CMake`" --build `"$Root\build`""
+$cmd = "`"$vcvars`" && `"$CMake`" -S `"$Root`" -B `"$Root\$BuildDir`" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_COMPILER=`"$CudaRoot\bin\nvcc.exe`" -DCMAKE_CUDA_ARCHITECTURES=89 -DCMAKE_MAKE_PROGRAM=`"$Ninja`" && `"$CMake`" --build `"$Root\$BuildDir`""
 cmd /c $cmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $bins = @("$CudaRoot\bin", "$CudaRoot\bin\x64") | Where-Object { Test-Path $_ }
-Set-Content -Path "$Root\build\cuda_bin.txt" -Value $bins -Encoding utf8
-Write-Output "Built $Root\build\adakernel.dll with $CudaRoot"
+Set-Content -Path "$Root\$BuildDir\cuda_bin.txt" -Value $bins -Encoding utf8
+Write-Output "Built $Root\$BuildDir\adakernel.dll with $CudaRoot"

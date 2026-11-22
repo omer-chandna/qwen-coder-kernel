@@ -10,6 +10,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 DEFAULT = Path.home() / ".ollama/models/blobs/sha256-c7f6915f1d9ccc059903e3bead2493f8e4389a7718e8c1c4eb62ffaf33843408"
@@ -145,3 +146,42 @@ def test_cached_stops_early(model):
 
     r = model.generate_cached(ids, 200, on_tokens=stop)
     assert 5 <= len(r["tokens"]) < 5 + 12
+
+
+def _long_prompt(n_chars: int = 4800) -> str:
+    src = (Path(__file__).resolve().parents[1] / "native" / "cuda" / "qwen35_model.cu").read_text(encoding="utf-8")
+    return ("<|im_start|>user\nExplain what this file does.\n\n```cpp\n" + src[:n_chars]
+            + "```<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
+
+
+@pytest.mark.parametrize("batched", [True, False])
+def test_tensor_core_attention_matches_scalar(model, batched):
+    """The tiled mma attention (prefill: batched=True; split-key verify path: batched=False, GEMV prefill in
+    12-column passes) against the older per-column scalar kernels, on a prompt spanning many key tiles."""
+    import numpy as np
+
+    ids = tokenize(MODEL, _long_prompt())
+    assert 1200 < len(ids) < 1900
+    model.set_prefill(batched)
+    try:
+        new = model.logits(ids)
+        model.set_attention(False)
+        old = model.logits(ids)
+    finally:
+        model.set_attention(True)
+        model.set_prefill(True)
+    assert int(np.argmax(new)) == int(np.argmax(old))
+    assert len(set(np.argsort(new)[-5:].tolist()) & set(np.argsort(old)[-5:].tolist())) >= 4
+    assert np.corrcoef(new, old)[0, 1] > 0.9995
+
+
+def test_tensor_core_decode_matches_scalar(model):
+    ids = tokenize(MODEL, _long_prompt())
+    new = model.generate(ids, 48)["tokens"]
+    model.set_attention(False)
+    try:
+        old = model.generate(ids, 48)["tokens"]
+    finally:
+        model.set_attention(True)
+    same = int(np.argmax(new != old)) if (new != old).any() else len(new)
+    assert same >= 40, f"tensor-core and scalar decode diverge at token {same}"

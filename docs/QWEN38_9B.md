@@ -155,15 +155,37 @@ then 0.3-0.55 s per step with 6.6-7.1k tokens cached, 82-100 tok/s, edits applie
 Context: the file declares 262144 tokens, but KV costs ~36 KB/token (8 attention layers + MTP, fp16), so 8 GB fits
 about 40k next to the weights. 8-bit KV would roughly double that.
 
+## Tensor-core attention (`k_attn_mma`)
+
+The first attention kernels gave every column its own block and did scalar FMAs, so prefill re-read the whole KV
+cache once per prompt token and a 12-column verify pass read it 12 times. `k_attn_mma` is FlashAttention-style:
+
+- A block holds 64 query rows: 16 columns x the 4 query heads that share one KV head (GQA packing).
+- Keys stream through shared memory 32 at a time, so each key is read once per block.
+- S = QK^T and O += PV are `mma.m16n8k16` (fp16 in, fp32 accumulate) with an online softmax. P never leaves
+  registers, since the S accumulator layout of two 8-key tiles is the A-operand layout of one 16-key step.
+- The same kernel with a key split (256-key chunks, merged by `k_attn_combine`) handles decode and verify, so one
+  pass reads the cache once whatever the draft length.
+- 168 registers per thread, no spills, 66 KB of shared memory.
+- `set_attention(False)` / `AK_Q35_ATTN_OLD=1` switch back to the scalar kernels.
+
+`benchmarks/long_context.py` (ctx 40960, 512-token prompt chunks, fresh prompts, 128 tokens of speculative decoding).
+The first 32 generated tokens were identical between the two kernels at every size:
+
+| prompt | first read: scalar -> mma | decode: scalar -> mma |
+|---|---|---|
+| 4k | 3.90 s -> 3.64 s (1.07x) | 68.4 -> 67.6 tok/s |
+| 12k | 14.3 s -> 12.0 s (1.20x) | 61.3 -> 74.2 tok/s |
+| 24k | 36.4 s -> 27.2 s (1.34x) | 51.9 -> 55.3 tok/s |
+| 36k | 66.4 s -> 45.8 s (1.45x) | 42.9 -> 52.6 tok/s |
+
+At 36k, attention is now roughly 13 s of the 46 s. The remaining ~33 s is the per-token cost of everything else
+(~1100 tok/s), mostly the sequential Gated DeltaNet recurrence.
+
 ## Next
 
-- Long-context attention: both the prefill kernel (one block per column, re-reading all keys) and the verify kernel
-  (one block per column) scale with context x columns; decode drops from ~95 to 47 tok/s and prefill from ~1100 to
-  ~700 tok/s by 24k. A flash-style tiled prefill kernel and a multi-column verify kernel that loads each key once
-  would fix both.
-- 8-bit KV cache for 64k+ contexts.
-- Prefill is now the bottleneck. Even one 740-token chunk only reaches ~1300 tok/s, so the cost is in the per-token
-  kernels (sequential Gated DeltaNet recurrence over T, fp16 dequant per chunk, attention), not chunking: profile
-  prefill and move to a chunked (WY / UT-transform) delta rule so the recurrence also runs on tensor cores.
-- Keep the prompt's KV/recurrent state across requests (prefix cache) so follow-up edits on the same file skip
-  prefill entirely.
+- Prefill is now limited by the recurrent layers, not attention: move to a chunked (WY / UT-transform) delta rule so
+  the 24 Gated DeltaNet layers also run on tensor cores.
+- `k_attn_mma` itself: cp.async double-buffering of the K/V tiles and `ldmatrix` fragment loads (it currently waits
+  on each tile load and packs V fragments element by element).
+- 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

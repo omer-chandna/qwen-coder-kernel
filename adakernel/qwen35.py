@@ -111,6 +111,8 @@ def _bind(lib) -> None:
     lib.ak_q35_generate_spec.restype = ctypes.c_int
     lib.ak_q35_set_prefill.argtypes = [vp, ctypes.c_int]
     lib.ak_q35_set_prefill.restype = ctypes.c_int
+    lib.ak_q35_set_attn.argtypes = [vp, ctypes.c_int]
+    lib.ak_q35_set_attn.restype = ctypes.c_int
     lib.ak_q35_logits.argtypes = [vp, vp, ctypes.c_int, ctypes.c_int, vp]
     lib.ak_q35_logits.restype = ctypes.c_int
     lib.ak_q35_profile.argtypes = [vp, vp, vp, ctypes.c_int]
@@ -335,6 +337,10 @@ class Qwen35Model:
     def set_prefill(self, batched: bool) -> None:
         """True (default): long prompts go through fp16 GEMM chunks; False: GEMV chunks of max_cols tokens."""
         self.native.check(self.native.lib.ak_q35_set_prefill(self.handle, int(batched)))
+
+    def set_attention(self, tensor_core: bool) -> None:
+        """True (default): tensor-core tiled attention; False: the older per-column scalar kernels."""
+        self.native.check(self.native.lib.ak_q35_set_attn(self.handle, int(tensor_core)))
 
     def logits(self, prompt, graph: bool = True) -> np.ndarray:
         tokens = np.ascontiguousarray(prompt, dtype=np.int32)

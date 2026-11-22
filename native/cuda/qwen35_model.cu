@@ -291,6 +291,7 @@ struct ak_q35_model {
     Bufs pf;                             // prefill, pf_cols columns, allocated on the first long prompt
     int pf_cols = kPfCols;
     bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
+    bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
     int draft_vocab = 0;                 // rows of the LM head the MTP draft scores (a prefix of the vocab)
     __half* w16 = nullptr;               // one matrix expanded to fp16 (prefill)
     size_t w16_n = 0;
@@ -874,6 +875,232 @@ __global__ void __launch_bounds__(256) k_attn_pf(const float* q, const __half* k
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Tensor-core attention (FlashAttention-style). A block holds 64 query rows - (column, head) pairs of one KV head's
+// group, row R = c * NR + head-in-group - in 4 warps of 16, and streams keys in tiles of 32 through shared memory,
+// so every key is read once per block instead of once per column. S = Q K^T and O += P V run as
+// mma.m16n8k16 (fp16 in, fp32 accumulate) with an online softmax; P stays in registers (the S accumulator layout of
+// two 8-key tiles is the A-operand layout of one 16-key step).
+//   !SPLIT (prefill): all keys [0, pos + c], finalize, * sigmoid(gate) -> fp16 o-projection input.
+//   SPLIT (decode / verify): keys of chunk blockIdx.y (kAttnChunk keys) -> unnormalized partials for k_attn_combine.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kAttnBK = 32;           // keys per shared-memory tile
+constexpr int kAttnRows = 64;         // query rows per block (4 warps x 16)
+constexpr int kAttnLd = kHd + 8;      // padded row stride (halves) against bank conflicts
+constexpr size_t kAttnSmem = static_cast<size_t>(kAttnRows + 2 * kAttnBK) * kAttnLd * sizeof(__half);
+static_assert(kHd == 256, "k_attn_mma assumes head dim 256 (scale 1/16)");
+static_assert(kAttnChunk % kAttnBK == 0, "split chunk must be whole key tiles");
+
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint32_t ld_h2(const __half* p) { return *reinterpret_cast<const uint32_t*>(p); }
+
+__device__ __forceinline__ uint32_t pack_f2(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+__device__ __forceinline__ uint32_t pack_h2(__half lo, __half hi) {
+    __half2 h = __halves2half2(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+template <int NR, bool SPLIT>
+__global__ void __launch_bounds__(128) k_attn_mma(const float* q, const __half* kc, const __half* vc, const float* qk,
+                                                  int qk_stride, __half* o16, float* part, const int* pos_p, int Hkv,
+                                                  int T, int n_split, int max_seq) {
+    extern __shared__ __align__(16) unsigned char attn_smem[];
+    __half* Qs = reinterpret_cast<__half*>(attn_smem);
+    __half* Ks = Qs + kAttnRows * kAttnLd;
+    __half* Vs = Ks + kAttnBK * kAttnLd;
+    const int g = blockIdx.x;
+    const int split = SPLIT ? static_cast<int>(blockIdx.y) : 0;
+    const int tile = SPLIT ? blockIdx.z : blockIdx.y;
+    const int Hq = Hkv * NR;
+    const int pos = *pos_p;
+    const int n_rows = T * NR;
+    const int row0 = tile * kAttnRows;
+    const int last_row = min(row0 + kAttnRows, n_rows) - 1;
+    const int seq_max = min(pos + last_row / NR + 1, max_seq);  // the block needs keys [0, seq_max)
+    int k_begin = 0, k_end = seq_max;
+    if (SPLIT) {
+        k_begin = split * kAttnChunk;
+        k_end = min(seq_max, k_begin + kAttnChunk);
+    }
+    if (k_begin >= k_end) return;  // uniform across the block
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int gq = lane >> 2;
+    const int tig = lane & 3;
+
+    // Q tile -> fp16, pre-scaled by 1/sqrt(256). Padding rows are zero.
+    for (int i = threadIdx.x; i < kAttnRows * (kHd / 2); i += blockDim.x) {
+        const int r = i / (kHd / 2);
+        const int d2 = (i - r * (kHd / 2)) * 2;
+        const int R = row0 + r;
+        float2 v = make_float2(0.f, 0.f);
+        if (R < n_rows) {
+            const int c = R / NR;
+            const int h = g * NR + (R - c * NR);
+            v = *reinterpret_cast<const float2*>(q + (static_cast<size_t>(c) * Hq + h) * kHd + d2);
+        }
+        *reinterpret_cast<__half2*>(Qs + r * kAttnLd + d2) = __floats2half2_rn(v.x * 0.0625f, v.y * 0.0625f);
+    }
+
+    // The two rows this thread accumulates and the last key each may see (-1: padding row).
+    const int rA = row0 + warp * 16 + gq;
+    const int rB = rA + 8;
+    const int limA = rA < n_rows ? min(pos + rA / NR, max_seq - 1) : -1;
+    const int limB = rB < n_rows ? min(pos + rB / NR, max_seq - 1) : -1;
+
+    float o[kHd / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < kHd / 8; ++nt) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
+    float mA = -1.0e30f, mB = -1.0e30f, lA = 0.f, lB = 0.f;
+
+    for (int kt = k_begin; kt < k_end; kt += kAttnBK) {
+        __syncthreads();  // previous tile consumed (first pass: Q stores visible)
+        for (int i = threadIdx.x; i < 2 * kAttnBK * (kHd / 8); i += blockDim.x) {
+            const int mat = i / (kAttnBK * (kHd / 8));
+            const int j = i - mat * (kAttnBK * (kHd / 8));
+            const int kr = j / (kHd / 8);
+            const int d8 = (j - kr * (kHd / 8)) * 8;
+            const int t = kt + kr;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (t < k_end) v = *reinterpret_cast<const uint4*>((mat ? vc : kc) + (static_cast<size_t>(t) * Hkv + g) * kHd + d8);
+            *reinterpret_cast<uint4*>((mat ? Vs : Ks) + kr * kAttnLd + d8) = v;
+        }
+        __syncthreads();
+
+        // S = Q K^T for this warp's 16 rows x 32 keys (4 n-tiles of 8 keys).
+        float s[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+        const __half* qa = Qs + (warp * 16 + gq) * kAttnLd + tig * 2;
+#pragma unroll
+        for (int ks = 0; ks < kHd / 16; ++ks) {
+            uint32_t a[4];
+            a[0] = ld_h2(qa + ks * 16);
+            a[1] = ld_h2(qa + 8 * kAttnLd + ks * 16);
+            a[2] = ld_h2(qa + ks * 16 + 8);
+            a[3] = ld_h2(qa + 8 * kAttnLd + ks * 16 + 8);
+#pragma unroll
+            for (int nt = 0; nt < 4; ++nt) {
+                const __half* kb = Ks + (nt * 8 + gq) * kAttnLd + ks * 16 + tig * 2;
+                uint32_t b[2] = {ld_h2(kb), ld_h2(kb + 8)};
+                mma16816(s[nt], a, b);
+            }
+        }
+
+        // Online softmax. Thread holds row A at s[nt][0..1] and row B at s[nt][2..3]; a row spans a lane quad.
+        float mxA = -1.0e30f, mxB = -1.0e30f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int key = kt + nt * 8 + tig * 2 + j;
+                if (key > limA) s[nt][j] = -1.0e30f;
+                if (key > limB) s[nt][2 + j] = -1.0e30f;
+                mxA = fmaxf(mxA, s[nt][j]);
+                mxB = fmaxf(mxB, s[nt][2 + j]);
+            }
+        }
+        mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, 1));
+        mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, 2));
+        mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, 1));
+        mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, 2));
+        const float nA = fmaxf(mA, mxA), nB = fmaxf(mB, mxB);
+        const float alA = __expf(mA - nA), alB = __expf(mB - nB);
+        mA = nA;
+        mB = nB;
+        float psA = 0.f, psB = 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int key = kt + nt * 8 + tig * 2 + j;
+                s[nt][j] = key <= limA ? __expf(s[nt][j] - nA) : 0.f;
+                s[nt][2 + j] = key <= limB ? __expf(s[nt][2 + j] - nB) : 0.f;
+                psA += s[nt][j];
+                psB += s[nt][2 + j];
+            }
+        }
+        lA = lA * alA + psA;
+        lB = lB * alB + psB;
+#pragma unroll
+        for (int nt = 0; nt < kHd / 8; ++nt) {
+            o[nt][0] *= alA;
+            o[nt][1] *= alA;
+            o[nt][2] *= alB;
+            o[nt][3] *= alB;
+        }
+
+        // O += P V, two 16-key steps over 32 dim tiles of 8.
+#pragma unroll
+        for (int kc2 = 0; kc2 < 2; ++kc2) {
+            uint32_t a[4];
+            a[0] = pack_f2(s[2 * kc2][0], s[2 * kc2][1]);
+            a[1] = pack_f2(s[2 * kc2][2], s[2 * kc2][3]);
+            a[2] = pack_f2(s[2 * kc2 + 1][0], s[2 * kc2 + 1][1]);
+            a[3] = pack_f2(s[2 * kc2 + 1][2], s[2 * kc2 + 1][3]);
+            const __half* vb = Vs + (kc2 * 16 + tig * 2) * kAttnLd + gq;
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; ++nt) {
+                const __half* v0 = vb + nt * 8;
+                uint32_t b[2];
+                b[0] = pack_h2(v0[0], v0[kAttnLd]);
+                b[1] = pack_h2(v0[8 * kAttnLd], v0[9 * kAttnLd]);
+                mma16816(o[nt], a, b);
+            }
+        }
+    }
+
+    lA += __shfl_xor_sync(0xffffffff, lA, 1);
+    lA += __shfl_xor_sync(0xffffffff, lA, 2);
+    lB += __shfl_xor_sync(0xffffffff, lB, 1);
+    lB += __shfl_xor_sync(0xffffffff, lB, 2);
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int R = half ? rB : rA;
+        if (R >= n_rows) continue;
+        const int c = R / NR;
+        const int h = g * NR + (R - c * NR);
+        const float l = half ? lB : lA;
+        if (SPLIT) {
+            float* dst = part + ((static_cast<size_t>(c) * Hq + h) * n_split + split) * (kHd + 2);
+            if (tig == 0) {
+                dst[0] = half ? mB : mA;
+                dst[1] = l;
+            }
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; ++nt) {
+                const int d = nt * 8 + tig * 2;
+                dst[2 + d] = o[nt][2 * half];
+                dst[3 + d] = o[nt][2 * half + 1];
+            }
+        } else {
+            const float inv = l > 0.f ? 1.f / l : 0.f;
+            const float* gate = qk + static_cast<size_t>(c) * qk_stride + h * 2 * kHd + kHd;
+            __half* dst = o16 + static_cast<size_t>(c) * Hq * kHd + h * kHd;
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; ++nt) {
+                const int d = nt * 8 + tig * 2;
+                const float v0 = o[nt][2 * half] * inv * sigmoidf(gate[d]);
+                const float v1 = o[nt][2 * half + 1] * inv * sigmoidf(gate[d + 1]);
+                *reinterpret_cast<__half2*>(dst + d) = __floats2half2_rn(v0, v1);
+            }
+        }
+    }
+}
+
 // silu(gate) * up -> Q8_1 / fp16, gu columns [gate ff | up ff]. grid (ff / 256, T).
 __global__ void k_silu_quant(const float* gu, int8_t* xq, float* xd, __half* o16, int ff) {
     const size_t c = blockIdx.y;
@@ -1046,7 +1273,29 @@ ak_status emit_attn(ak_q35_model* m, const Bufs& b, const Layer& L, int T, const
                                                                   m->n_rot, m->max_seq);
     mark(p, s, kKAttnPrep);
     const int ratio = m->hq / m->hkv;
-    if (b.pf) {
+    if (!m->attn_old) {
+        const int tiles = (T * ratio + kAttnRows - 1) / kAttnRows;
+        auto launch = [&](auto kern, dim3 grid) {
+            kern<<<grid, 128, kAttnSmem, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, m->part, pos_p, m->hkv, T,
+                                              m->n_split, m->max_seq);
+        };
+        if (b.pf) {
+            const dim3 grid(m->hkv, tiles);
+            if (ratio == 1) launch(k_attn_mma<1, false>, grid);
+            else if (ratio == 2) launch(k_attn_mma<2, false>, grid);
+            else launch(k_attn_mma<4, false>, grid);
+            mark(p, s, kKAttnPart);
+        } else {
+            const dim3 grid(m->hkv, m->n_split, tiles);
+            if (ratio == 1) launch(k_attn_mma<1, true>, grid);
+            else if (ratio == 2) launch(k_attn_mma<2, true>, grid);
+            else launch(k_attn_mma<4, true>, grid);
+            mark(p, s, kKAttnPart);
+            k_attn_combine<<<dim3(m->hq, T), kHd, 0, s>>>(m->part, qk, m->big_n, b.aq, b.ad, pos_p, m->n_split,
+                                                          m->max_seq);
+            mark(p, s, kKAttnCombine);
+        }
+    } else if (b.pf) {
         const dim3 grid(m->hkv, T);
         if (ratio == 1) k_attn_pf<1><<<grid, 256, 0, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, pos_p, m->hkv, m->max_seq);
         else if (ratio == 2) k_attn_pf<2><<<grid, 256, 0, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, pos_p, m->hkv, m->max_seq);
@@ -1755,6 +2004,19 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
         const char* e = std::getenv("AK_Q35_NO_PF");
         m->no_pf = e && e[0] == '1';
         m->draft_vocab = m->vocab;
+        const char* a = std::getenv("AK_Q35_ATTN_OLD");
+        m->attn_old = a && a[0] == '1';
+    }
+    // The tensor-core attention kernels need more than the default 48 KB of dynamic shared memory.
+    for (const void* f : {reinterpret_cast<const void*>(k_attn_mma<1, false>),
+                          reinterpret_cast<const void*>(k_attn_mma<2, false>),
+                          reinterpret_cast<const void*>(k_attn_mma<4, false>),
+                          reinterpret_cast<const void*>(k_attn_mma<1, true>),
+                          reinterpret_cast<const void*>(k_attn_mma<2, true>),
+                          reinterpret_cast<const void*>(k_attn_mma<4, true>)}) {
+        if (st == AK_OK) {
+            st = ck(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kAttnSmem)));
+        }
     }
     if (st == AK_OK) st = reset(m);
     if (st != AK_OK) {
@@ -2124,6 +2386,19 @@ extern "C" ak_status ak_q35_cache_load(ak_q35_model* m, int slot) {
         return AK_ERR_INVALID;
     }
     return snap_copy(m, slot, false);
+}
+
+extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
+    if (!m) {
+        ak_set_error("qwen35 set_attn: null model");
+        return AK_ERR_INVALID;
+    }
+    if (m->attn_old == !tensor_core) return AK_OK;
+    ak_status st = ck(cudaStreamSynchronize(m->stream));
+    for (auto& kv : m->graphs) cudaGraphExecDestroy(kv.second);  // captured graphs bake in the kernel choice
+    m->graphs.clear();
+    m->attn_old = !tensor_core;
+    return st;
 }
 
 extern "C" ak_status ak_q35_set_prefill(ak_q35_model* m, int batched) {

@@ -445,6 +445,8 @@ AK_API ak_status ak_q35_generate_spec_ex(ak_q35_model* model, const int32_t* pro
 AK_API ak_status ak_q35_cache_load(ak_q35_model* model, int slot);
 /* Prompt processing path: 1 (default) batched fp16 GEMM chunks for long prompts, 0 GEMV chunks of max_cols tokens. */
 AK_API ak_status ak_q35_set_prefill(ak_q35_model* model, int batched);
+/* Attention kernels: 1 (default) tensor-core tiled, 0 the older per-column scalar ones (also AK_Q35_ATTN_OLD=1). */
+AK_API ak_status ak_q35_set_attn(ak_q35_model* model, int tensor_core);
 /* Logits after the last prompt token. */
 AK_API ak_status ak_q35_logits(ak_q35_model* model, const int32_t* prompt, int n_prompt, int use_graph,
                                float* logits);
