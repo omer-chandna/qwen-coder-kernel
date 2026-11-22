@@ -187,6 +187,25 @@ def test_tensor_core_decode_matches_scalar(model):
     assert same >= 40, f"tensor-core and scalar decode diverge at token {same}"
 
 
+@pytest.mark.parametrize("batched", [True, False])
+def test_attention_v2_matches_v1(model, batched):
+    """k_attn_mma2 keeps k_attn_mma's mma and softmax order, so logits and greedy tokens must be identical."""
+    ids = tokenize(MODEL, _long_prompt())
+    model.set_prefill(batched)
+    try:
+        model.set_attention(1)
+        ref = model.logits(ids)
+        ref_tok = model.generate_spec(ids, 32)["tokens"]
+        model.set_attention(2)
+        new = model.logits(ids)
+        new_tok = model.generate_spec(ids, 32)["tokens"]
+    finally:
+        model.set_attention(1)
+        model.set_prefill(True)
+    assert np.array_equal(ref, new)
+    assert np.array_equal(ref_tok, new_tok)
+
+
 def test_fused_quantized_gemm_matches_cublas(model):
     """Prefill with the fused dequant + mma GEMM (both token-tile widths) against fp16 expansion + cuBLAS."""
     ids = tokenize(MODEL, _long_prompt())

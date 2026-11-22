@@ -277,13 +277,94 @@ End to end (40k context, 512-token chunks), `benchmarks/followup.py`, cuBLAS -> 
 Switches: `set_int8(False)` / `AK_Q35_INT8=0` (fp16 fused / cuBLAS), `AK_Q35_MMQ_SHORT` / `AK_Q35_MMQ_LONG` (tile
 configurations) and `AK_Q35_QDIAG` (diagnostics).
 
+## Attention v2 (`k_attn_mma2`): status and reasoning
+
+**Status: written, compiled (0 spills), not yet measured.** The GPU was busy with a running server during this round,
+so the kernel is opt-in (`AK_Q35_ATTN=2` / `set_attention(2)`). The default stays `k_attn_mma` (v1) until the
+checks below pass on the card. Then the default becomes a one-line change (`int attn = 1` in `qwen35_model.cu`).
+
+How to check it, with no model load (random Q/K/V, ~150 MB of VRAM):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scriptsttn_bench.ps1
+```
+
+`benchmarks/attn_bench.cu` includes `qwen35_model.cu`, so it launches the runtime's own kernels with the model's
+shapes (4 KV heads x 4 query heads, head dim 256, max_seq 40960). It runs v1 and v2 on identical inputs for prefill
+chunks (T = 64 / 512 / 1024 at positions 0-32000) and decode / verify passes (T = 1 / 12). It prints the time of
+each and whether the outputs are bit-identical. With the model: `pytest tests/test_qwen35.py -k attention_v2`
+(identical logits and speculative tokens, batched and GEMV prefill).
+
+### Why v1 runs at ~40% of the tensor-core rate
+
+A 512-token chunk at position 32000 spends 360 ms in attention over 8 layers. Each layer runs 4 KV heads x 32 row
+tiles = 128 blocks, and each block walks ~1000 key tiles of 32 keys. That is ~1.02 M block-tiles. With one block per
+SM (66 KB of shared memory each, 24 SMs), that comes to ~42.7k tiles per SM, or **~8.4 us (~20.7k cycles) per tile**.
+
+The math per tile is 128 `mma.m16n8k16` per warp: 64 for S = QK^T and 64 for PV. On GeForce Ada, fp16 with fp32
+accumulate runs at about 127 FMA / clock / SM (~15 TFLOPS on the 4060), so each sub-partition (one warp here) needs
+about 64 cycles per mma. That makes **~8.2k cycles of tensor work per tile**, about 40% of the measured time. The
+other ~60% goes to three costs:
+
+1. **Load latency, fully exposed.** v1 loads the K/V tile through registers (`for i ... ld.global; st.shared`),
+   then `__syncthreads`, then computes. Only 4 warps are on the SM, so nothing else can run while ~16 KB come back
+   from L2. That costs a few thousand cycles per tile, serialized with the math.
+2. **Shared-load instruction count.** Per 32-key tile and warp, v1 issues 64 `LDS.32` for Q fragments and 128 for K
+   fragments. For PV it issues 256 `LDS.U16` plus 128 pack instructions, because V is stored key-major and the B
+   operand wants pairs along the key axis. That makes **448 shared-load instructions per 128 mmas**, all from 1 warp
+   per scheduler, which crowds out mma issue.
+3. Softmax and rescale (~0.6k cycles): masking, 4 shuffles, 16 exps and 128 `FMUL`s on `o` per tile. This part stays.
+
+### What v2 changes, and why these choices
+
+- **`ldmatrix` for every operand.** `ldmatrix.x4` loads four 8x8 fp16 matrices, and each lane ends up with exactly
+  the register layout an mma fragment needs:
+  - Q: 1 instruction per 16-dim step, giving a[0..3].
+  - K: 1 instruction per pair of 8-key tiles, since K rows are keys, which is already the "B transposed" layout.
+  - V: `ldmatrix.trans`, 1 instruction per pair of 8-dim tiles. The transpose happens in the load, so the
+    16-bit gathers and packs go away.
+
+  That gives **80 instead of 448 load instructions per 128 mmas** (5.6x fewer). The 528-byte padded row stride
+  (`kHd + 8` halves) stays: it is 4 banks per row, so the 8 row addresses of each 8x8 matrix land in 8 different
+  4-bank groups, with no bank conflicts. That is why the padding was kept instead of switching to an XOR swizzle.
+- **`cp.async`, split by operand instead of double-buffered.** A full double buffer (2 x K + 2 x V + Q) needs
+  101,376 bytes, which is exactly the 99 KB per-block limit. It would leave no slack and no room for anything else.
+  v2 keeps one K and one V buffer (66 KB, same as v1) and staggers them:
+  - copy V(t) while S = Q K(t)^T and the softmax run;
+  - copy K(t+1) while O += P V(t) runs.
+
+  Each copy overlaps one compute phase of about 4k cycles, which is much longer than an L2 round trip, so the load
+  latency is hidden. It costs two barriers per tile, the same number as v1. Rows past the end of the range are
+  zero-filled by `cp.async` (src-size 0), so masked keys never multiply garbage (0 x NaN = NaN) in PV.
+- **The arithmetic is unchanged on purpose.** The same mma order per accumulator, the same fp16 rounding of Q and P,
+  and the same softmax code. So v2 must be **bit-identical** to v1. That makes the check strict and cheap: any
+  difference is a bug, not a rounding question. It also keeps the "speculative output == greedy" guarantee intact
+  without new tolerance arguments.
+- **Not done:**
+  - fp16 accumulation for S (2x tensor rate on GeForce). Logits reach ~30, where the fp16 spacing is 0.016-0.03,
+    so attention weights would be off by 1-3%. That is the same accuracy trade that was rejected for cuBLAS.
+  - A larger key tile (BK = 64). It halves the barriers, but Q + K + V at 64 keys is again exactly 99 KB, and the S
+    accumulators would add 16 more registers to the 242 used now.
+  - More warps per block. Q (33 KB) dominates shared memory, so 8 warps would need 128 rows of Q and would not fit
+    with K/V tiles.
+
+Expected effect, an estimate until measured: tensor work plus softmax is ~9-10k cycles per tile, against 20.7k
+today. So attention could get up to ~2x faster: at 32k, ~360 -> ~190 ms per 512-token chunk, or ~770 -> ~600 ms
+for the whole chunk. Decode and verify at long context use the same kernel (the SPLIT variant), so they gain too,
+but less, since they are bound by weight bandwidth.
+
+Registers: v2 uses 236-242 per thread against v1's 167-168, because the unrolled `ldmatrix` loads are hoisted. There
+are no spills, and occupancy is unchanged: shared memory already limits the SM to one 4-warp block.
+
 ## Next
 
+- **Measure attention v2** (`scriptsttn_bench.ps1`, then `benchmarks/long_context.py` with `AK_Q35_ATTN=2`).
+  If it is bit-identical and faster, make it the default and record the numbers above.
 - **The int8 GEMM is now latency-bound:** ~0.45 ms per token against an instruction-issue estimate of ~0.16. Options:
   - a 256-row block of 16 warps, for more reuse per loaded activation tile (Q4_K fits in shared memory; Q6_K needs a
     single stage);
   - `ldmatrix` for the activation fragments;
-  - moving the Q4_K min term out of the inner loop.
-- `k_attn_mma` (47% of a chunk at 32k): cp.async double-buffering of the K/V tiles, `ldmatrix` fragment loads and
-  more warps per block. Only one 4-warp block fits per SM today.
+  - moving the Q4_K min term out of the inner loop. Note: doing that exactly needs the same number of FMAs elsewhere
+    (it is a rows x T x K/32 product). It only pays off if that product goes on tensor cores, in fp16, which costs
+    accuracy against the decode path. So do this one last.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

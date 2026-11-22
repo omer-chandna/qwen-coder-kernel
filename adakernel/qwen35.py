@@ -344,9 +344,11 @@ class Qwen35Model:
         """True (default): long prompts go through fp16 GEMM chunks; False: GEMV chunks of max_cols tokens."""
         self.native.check(self.native.lib.ak_q35_set_prefill(self.handle, int(batched)))
 
-    def set_attention(self, tensor_core: bool) -> None:
-        """True (default): tensor-core tiled attention; False: the older per-column scalar kernels."""
-        self.native.check(self.native.lib.ak_q35_set_attn(self.handle, int(tensor_core)))
+    def set_attention(self, tensor_core: bool | int) -> None:
+        """True / 1 (default): tensor-core tiled attention; 2: its v2 (ldmatrix + cp.async, opt-in until benchmarked);
+        False / 0: the older per-column scalar kernels."""
+        mode = int(tensor_core)
+        self.native.check(self.native.lib.ak_q35_set_attn(self.handle, mode))
 
     def set_qgemm(self, max_cols: int) -> None:
         """Prefill chunks of up to max_cols tokens use the fused quantized GEMM (0: always cuBLAS, -1: always fused)."""

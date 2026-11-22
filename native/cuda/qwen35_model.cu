@@ -292,7 +292,9 @@ struct ak_q35_model {
     Bufs pf;                             // prefill, pf_cols columns, allocated on the first long prompt
     int pf_cols = kPfCols;
     bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
-    bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
+    int attn = 1;                        // attention kernels: 0 per-column scalar, 1 k_attn_mma, 2 k_attn_mma2
+                                         // (AK_Q35_ATTN; AK_Q35_ATTN_OLD=1 is 0). v2 becomes the default once
+                                         // benchmarks/attn_bench.cu has confirmed it on the GPU.
     int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
                                          // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
     bool int8_gemm = true;               // prefill GEMMs on int8 tensor cores with Q8_1 activations, the decode path's
@@ -1112,6 +1114,242 @@ __global__ void __launch_bounds__(128) k_attn_mma(const float* q, const __half* 
     }
 }
 
+// ------------------------------------------------------------------------------------------------
+// Tensor-core attention, v2 (`k_attn_mma2`, opt-in: AK_Q35_ATTN=2 / set_attention(2)). Same tiling, masking and outputs as k_attn_mma; two changes
+// in how data reaches the tensor cores (docs/QWEN38_9B.md, "Attention v2"):
+//   1. Every mma operand comes from one ldmatrix instead of 32-bit / 16-bit shared loads. v1 issued 12 LDS.32 per
+//      four S mmas and 4 LDS.16 + 2 packs per PV mma, so the PV half was load-issue bound; ldmatrix.x4 gives the
+//      Q fragment of one 16-dim step, the K fragments of two 8-key tiles, or (with .trans, since V is stored key-major
+//      and PV needs it dim-major) the V fragments of two 8-dim tiles.
+//   2. K and V tiles stream in with cp.async, overlapped with compute: V(t) is copied while S = Q K(t)^T and the
+//      softmax run, and K(t+1) while O += P V(t) runs. Splitting the pipeline by operand rather than double-buffering
+//      both keeps shared memory at v1's 66 KB (a full K+V double buffer would need the whole 99 KB).
+// ------------------------------------------------------------------------------------------------
+
+__device__ __forceinline__ void ldsm_x4(uint32_t* r, const __half* p) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(s)
+                 : "memory");
+}
+
+__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const __half* p) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(p));
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+                 : "r"(s)
+                 : "memory");
+}
+
+__device__ __forceinline__ void attn_cp16(__half* smem, const __half* gmem, bool valid) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0) : "memory");
+}
+__device__ __forceinline__ void attn_cp_commit() { asm volatile("cp.async.commit_group;\n" ::: "memory"); }
+__device__ __forceinline__ void attn_cp_wait_all() { asm volatile("cp.async.wait_group 0;\n" ::: "memory"); }
+
+// One 32-key tile of K or V (rows kt..kt+31 of KV head g) -> shared, asynchronously. Rows >= k_end are zero-filled
+// (src-size 0), so masked keys never multiply garbage (0 * NaN) in P V.
+__device__ __forceinline__ void attn_tile_async(__half* dst, const __half* src, int kt, int k_end, int Hkv, int g) {
+#pragma unroll
+    for (int j = 0; j < kAttnBK * (kHd / 8) / 128; ++j) {
+        const int i = threadIdx.x + j * 128;
+        const int kr = i / (kHd / 8);
+        const int d8 = (i - kr * (kHd / 8)) * 8;
+        const int t = kt + kr;
+        const bool ok = t < k_end;
+        attn_cp16(dst + kr * kAttnLd + d8, src + (static_cast<size_t>(ok ? t : 0) * Hkv + g) * kHd + d8, ok);
+    }
+}
+
+template <int NR, bool SPLIT>
+__global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half* kc, const __half* vc, const float* qk,
+                                                   int qk_stride, __half* o16, float* part, const int* pos_p, int Hkv,
+                                                   int T, int n_split, int max_seq) {
+    extern __shared__ __align__(16) unsigned char attn_smem[];
+    __half* Qs = reinterpret_cast<__half*>(attn_smem);
+    __half* Ks = Qs + kAttnRows * kAttnLd;
+    __half* Vs = Ks + kAttnBK * kAttnLd;
+    const int g = blockIdx.x;
+    const int split = SPLIT ? static_cast<int>(blockIdx.y) : 0;
+    const int tile = SPLIT ? blockIdx.z : blockIdx.y;
+    const int Hq = Hkv * NR;
+    const int pos = *pos_p;
+    const int n_rows = T * NR;
+    const int row0 = tile * kAttnRows;
+    const int last_row = min(row0 + kAttnRows, n_rows) - 1;
+    const int seq_max = min(pos + last_row / NR + 1, max_seq);
+    int k_begin = 0, k_end = seq_max;
+    if (SPLIT) {
+        k_begin = split * kAttnChunk;
+        k_end = min(seq_max, k_begin + kAttnChunk);
+    }
+    if (k_begin >= k_end) return;
+
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int gq = lane >> 2;
+    const int tig = lane & 3;
+
+    attn_tile_async(Ks, kc, k_begin, k_end, Hkv, g);  // first K tile in flight while Q is converted
+    attn_cp_commit();
+    for (int i = threadIdx.x; i < kAttnRows * (kHd / 2); i += blockDim.x) {
+        const int r = i / (kHd / 2);
+        const int d2 = (i - r * (kHd / 2)) * 2;
+        const int R = row0 + r;
+        float2 v = make_float2(0.f, 0.f);
+        if (R < n_rows) {
+            const int c = R / NR;
+            const int h = g * NR + (R - c * NR);
+            v = *reinterpret_cast<const float2*>(q + (static_cast<size_t>(c) * Hq + h) * kHd + d2);
+        }
+        *reinterpret_cast<__half2*>(Qs + r * kAttnLd + d2) = __floats2half2_rn(v.x * 0.0625f, v.y * 0.0625f);
+    }
+
+    const int rA = row0 + warp * 16 + gq;
+    const int rB = rA + 8;
+    const int limA = rA < n_rows ? min(pos + rA / NR, max_seq - 1) : -1;
+    const int limB = rB < n_rows ? min(pos + rB / NR, max_seq - 1) : -1;
+
+    // Per-lane ldmatrix row addresses (lane l supplies the address of one 8-element row of one of the 4 matrices).
+    //   Q (A, 16 rows x 16 dims): matrices (rows 0-7 | 8-15) x (dims 0-7 | 8-15) -> a[0..3].
+    //   K (B of S, non-trans): keys (l & 7) + 8 * (l >> 4), dims 8 * ((l >> 3) & 1) -> b[nt][0..1], b[nt+1][0..1].
+    //   V (B of PV, .trans): keys (l & 7) + 8 * ((l >> 3) & 1), dims 8 * (l >> 4) -> b[nt][0..1], b[nt+1][0..1].
+    const __half* q_ld = Qs + (warp * 16 + (lane & 15)) * kAttnLd + (lane >> 4) * 8;
+    const __half* k_ld = Ks + ((lane & 7) + 8 * (lane >> 4)) * kAttnLd + 8 * ((lane >> 3) & 1);
+    const __half* v_ld = Vs + ((lane & 7) + 8 * ((lane >> 3) & 1)) * kAttnLd + 8 * (lane >> 4);
+
+    float o[kHd / 8][4];
+#pragma unroll
+    for (int nt = 0; nt < kHd / 8; ++nt) o[nt][0] = o[nt][1] = o[nt][2] = o[nt][3] = 0.f;
+    float mA = -1.0e30f, mB = -1.0e30f, lA = 0.f, lB = 0.f;
+
+    for (int kt = k_begin; kt < k_end; kt += kAttnBK) {
+        attn_cp_wait_all();
+        __syncthreads();  // K(kt) and Q visible; every warp is done with V(kt - BK)
+        attn_tile_async(Vs, vc, kt, k_end, Hkv, g);
+        attn_cp_commit();
+
+        float s[4][4];
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) s[nt][0] = s[nt][1] = s[nt][2] = s[nt][3] = 0.f;
+#pragma unroll
+        for (int ks = 0; ks < kHd / 16; ++ks) {
+            uint32_t a[4], kb[2][4];
+            ldsm_x4(a, q_ld + ks * 16);
+            ldsm_x4(kb[0], k_ld + ks * 16);
+            ldsm_x4(kb[1], k_ld + 16 * kAttnLd + ks * 16);
+            mma16816(s[0], a, &kb[0][0]);
+            mma16816(s[1], a, &kb[0][2]);
+            mma16816(s[2], a, &kb[1][0]);
+            mma16816(s[3], a, &kb[1][2]);
+        }
+
+        float mxA = -1.0e30f, mxB = -1.0e30f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int key = kt + nt * 8 + tig * 2 + j;
+                if (key > limA) s[nt][j] = -1.0e30f;
+                if (key > limB) s[nt][2 + j] = -1.0e30f;
+                mxA = fmaxf(mxA, s[nt][j]);
+                mxB = fmaxf(mxB, s[nt][2 + j]);
+            }
+        }
+        mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, 1));
+        mxA = fmaxf(mxA, __shfl_xor_sync(0xffffffff, mxA, 2));
+        mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, 1));
+        mxB = fmaxf(mxB, __shfl_xor_sync(0xffffffff, mxB, 2));
+        const float nA = fmaxf(mA, mxA), nB = fmaxf(mB, mxB);
+        const float alA = __expf(mA - nA), alB = __expf(mB - nB);
+        mA = nA;
+        mB = nB;
+        float psA = 0.f, psB = 0.f;
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int key = kt + nt * 8 + tig * 2 + j;
+                s[nt][j] = key <= limA ? __expf(s[nt][j] - nA) : 0.f;
+                s[nt][2 + j] = key <= limB ? __expf(s[nt][2 + j] - nB) : 0.f;
+                psA += s[nt][j];
+                psB += s[nt][2 + j];
+            }
+        }
+        lA = lA * alA + psA;
+        lB = lB * alB + psB;
+#pragma unroll
+        for (int nt = 0; nt < kHd / 8; ++nt) {
+            o[nt][0] *= alA;
+            o[nt][1] *= alA;
+            o[nt][2] *= alB;
+            o[nt][3] *= alB;
+        }
+
+        attn_cp_wait_all();
+        __syncthreads();  // V(kt) visible; every warp is done with K(kt)
+        if (kt + kAttnBK < k_end) attn_tile_async(Ks, kc, kt + kAttnBK, k_end, Hkv, g);
+        attn_cp_commit();
+
+#pragma unroll
+        for (int kc2 = 0; kc2 < 2; ++kc2) {
+            uint32_t a[4];
+            a[0] = pack_f2(s[2 * kc2][0], s[2 * kc2][1]);
+            a[1] = pack_f2(s[2 * kc2][2], s[2 * kc2][3]);
+            a[2] = pack_f2(s[2 * kc2 + 1][0], s[2 * kc2 + 1][1]);
+            a[3] = pack_f2(s[2 * kc2 + 1][2], s[2 * kc2 + 1][3]);
+            const __half* vb = v_ld + kc2 * 16 * kAttnLd;
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; nt += 2) {
+                uint32_t b[4];
+                ldsm_x4_t(b, vb + nt * 8);
+                mma16816(o[nt], a, &b[0]);
+                mma16816(o[nt + 1], a, &b[2]);
+            }
+        }
+    }
+
+    lA += __shfl_xor_sync(0xffffffff, lA, 1);
+    lA += __shfl_xor_sync(0xffffffff, lA, 2);
+    lB += __shfl_xor_sync(0xffffffff, lB, 1);
+    lB += __shfl_xor_sync(0xffffffff, lB, 2);
+
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int R = half ? rB : rA;
+        if (R >= n_rows) continue;
+        const int c = R / NR;
+        const int h = g * NR + (R - c * NR);
+        const float l = half ? lB : lA;
+        if (SPLIT) {
+            float* dst = part + ((static_cast<size_t>(c) * Hq + h) * n_split + split) * (kHd + 2);
+            if (tig == 0) {
+                dst[0] = half ? mB : mA;
+                dst[1] = l;
+            }
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; ++nt) {
+                const int d = nt * 8 + tig * 2;
+                dst[2 + d] = o[nt][2 * half];
+                dst[3 + d] = o[nt][2 * half + 1];
+            }
+        } else {
+            const float inv = l > 0.f ? 1.f / l : 0.f;
+            const float* gate = qk + static_cast<size_t>(c) * qk_stride + h * 2 * kHd + kHd;
+            __half* dst = o16 + static_cast<size_t>(c) * Hq * kHd + h * kHd;
+#pragma unroll
+            for (int nt = 0; nt < kHd / 8; ++nt) {
+                const int d = nt * 8 + tig * 2;
+                const float v0 = o[nt][2 * half] * inv * sigmoidf(gate[d]);
+                const float v1 = o[nt][2 * half + 1] * inv * sigmoidf(gate[d + 1]);
+                *reinterpret_cast<__half2*>(dst + d) = __floats2half2_rn(v0, v1);
+            }
+        }
+    }
+}
+
 // silu(gate) * up -> Q8_1 / fp16, gu columns [gate ff | up ff]. grid (ff / 256, T).
 __global__ void k_silu_quant(const float* gu, int8_t* xq, float* xd, __half* o16, int ff) {
     const size_t c = blockIdx.y;
@@ -1370,23 +1608,24 @@ ak_status emit_attn(ak_q35_model* m, const Bufs& b, const Layer& L, int T, const
                                                                   m->n_rot, m->max_seq);
     mark(p, s, kKAttnPrep);
     const int ratio = m->hq / m->hkv;
-    if (!m->attn_old) {
+    if (m->attn != 0) {
         const int tiles = (T * ratio + kAttnRows - 1) / kAttnRows;
         auto launch = [&](auto kern, dim3 grid) {
             kern<<<grid, 128, kAttnSmem, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, m->part, pos_p, m->hkv, T,
                                               m->n_split, m->max_seq);
         };
+        const bool v2 = m->attn == 2;
         if (b.pf) {
             const dim3 grid(m->hkv, tiles);
-            if (ratio == 1) launch(k_attn_mma<1, false>, grid);
-            else if (ratio == 2) launch(k_attn_mma<2, false>, grid);
-            else launch(k_attn_mma<4, false>, grid);
+            if (ratio == 1) launch(v2 ? k_attn_mma2<1, false> : k_attn_mma<1, false>, grid);
+            else if (ratio == 2) launch(v2 ? k_attn_mma2<2, false> : k_attn_mma<2, false>, grid);
+            else launch(v2 ? k_attn_mma2<4, false> : k_attn_mma<4, false>, grid);
             mark(p, s, kKAttnPart);
         } else {
             const dim3 grid(m->hkv, m->n_split, tiles);
-            if (ratio == 1) launch(k_attn_mma<1, true>, grid);
-            else if (ratio == 2) launch(k_attn_mma<2, true>, grid);
-            else launch(k_attn_mma<4, true>, grid);
+            if (ratio == 1) launch(v2 ? k_attn_mma2<1, true> : k_attn_mma<1, true>, grid);
+            else if (ratio == 2) launch(v2 ? k_attn_mma2<2, true> : k_attn_mma<2, true>, grid);
+            else launch(v2 ? k_attn_mma2<4, true> : k_attn_mma<4, true>, grid);
             mark(p, s, kKAttnPart);
             k_attn_combine<<<dim3(m->hq, T), kHd, 0, s>>>(m->part, qk, m->big_n, b.aq, b.ad, pos_p, m->n_split,
                                                           m->max_seq);
@@ -2121,7 +2360,9 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
         m->no_pf = e && e[0] == '1';
         m->draft_vocab = m->vocab;
         const char* a = std::getenv("AK_Q35_ATTN_OLD");
-        m->attn_old = a && a[0] == '1';
+        if (a && a[0] == '1') m->attn = 0;
+        const char* av = std::getenv("AK_Q35_ATTN");
+        if (av && av[0] >= '0' && av[0] <= '2') m->attn = av[0] - '0';
     }
     // The tensor-core attention kernels need more than the default 48 KB of dynamic shared memory.
     for (const void* f : {reinterpret_cast<const void*>(k_attn_mma<1, false>),
@@ -2129,7 +2370,13 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
                           reinterpret_cast<const void*>(k_attn_mma<4, false>),
                           reinterpret_cast<const void*>(k_attn_mma<1, true>),
                           reinterpret_cast<const void*>(k_attn_mma<2, true>),
-                          reinterpret_cast<const void*>(k_attn_mma<4, true>)}) {
+                          reinterpret_cast<const void*>(k_attn_mma<4, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<1, false>),
+                          reinterpret_cast<const void*>(k_attn_mma2<2, false>),
+                          reinterpret_cast<const void*>(k_attn_mma2<4, false>),
+                          reinterpret_cast<const void*>(k_attn_mma2<1, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<2, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<4, true>)}) {
         if (st == AK_OK) {
             st = ck(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kAttnSmem)));
         }
@@ -2509,11 +2756,12 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
         ak_set_error("qwen35 set_attn: null model");
         return AK_ERR_INVALID;
     }
-    if (m->attn_old == !tensor_core) return AK_OK;
+    const int mode = tensor_core < 0 || tensor_core > 2 ? 1 : tensor_core;
+    if (m->attn == mode) return AK_OK;
     ak_status st = ck(cudaStreamSynchronize(m->stream));
     for (auto& kv : m->graphs) cudaGraphExecDestroy(kv.second);  // captured graphs bake in the kernel choice
     m->graphs.clear();
-    m->attn_old = !tensor_core;
+    m->attn = mode;
     return st;
 }
 
