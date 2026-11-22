@@ -800,15 +800,29 @@ speedup. All tests pass, and llama.cpp agreement is unchanged (`llama_match`: 13
 
 ## Next
 
-- **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around
-  a cooperative scale-decode phase that the tensor cores sit out. Decoding the scales for stage t+1 during stage t,
-  or per thread in registers, would remove one barrier per stage.
-- **Gated DeltaNet recurrence**: now 16 ms of a 512-token chunk (6%). A chunked (WY / UT-transform) formulation could
-  put it on tensor cores, but at most ~5% of a chunk is left to win.
-- **Wide verify** is now 30.4 ms at 12 columns against a 22 ms floor. The rest is the float epilogue and dp4a work
-  per column. It must stay bit-identical to the T = 1 decode path, which rules out tensor cores unless decode moves
-  to the same arithmetic.
-- **MTP-drafted decode** (prose, tests) is ~85% target pass, and its 4-5-column passes are within ~10% of the
-  weight-bandwidth floor (22.2 ms for 4.9 GB, ~221 GB/s against a ~246 GB/s copy peak). MTP draft steps cost ~1.3 ms
-  each. Further gains there need more accepted tokens per round (draft quality), not faster kernels.
-- 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.
+Where a 512-token prefill chunk at position 0 goes now (269 ms): int8 GEMMs 235 (87%), delta rule 16, the rest
+(norms, conv, quantization) 13, attention 3.5. At position 32000, attention adds 108 ms. A decode step is 22.2 ms
+at short context and 26.7 at 32k (attention 4.8 ms).
+
+- **The int8 GEMMs are the main cost of prompt reading**, at 18-20 TMAC/s against ~60 for int8 tensor cores. The
+  DIAG runs (`gemm_bench.cu`) found no single dominant cause:
+  - the float epilogue is ~30% of the kernel;
+  - the per-stage scale decode and its barrier are 5-12%;
+  - copies, barriers and fragment loads make up most of the rest;
+  - reordering mmas and vectorizing scale loads did nothing or hurt.
+
+  The next step needs stall reasons per instruction. The Nsight Compute installed here (2020.3) predates Ada; a
+  current one (2023.1+) would show whether the kernel waits on shared memory, barriers or the tensor pipe. Without
+  it, the candidates are a scale decode moved off the critical path (registers, or one stage ahead) and `ldmatrix`
+  fragment loads.
+- **8-bit KV cache.** At 32k, decode attention is 18% of a step and already at bandwidth (1.07 GB in 4.8 ms), so int8
+  K / V with per-32 scales would save ~2.4 ms per step (~9%) and double the context that fits in 8 GB (~40k -> ~80k).
+  The cost is a dequantize step in the tensor-core attention kernel (cp.async cannot convert), which would slow
+  long-context prefill attention unless it overlaps with the mma work.
+- **Wide verify** is 30.4 ms at 12 columns against a 22 ms floor. The epilogue is no longer the limit (regrouping it
+  gained nothing). It must stay bit-identical to the T = 1 decode path.
+- **MTP-drafted decode** (prose, tests) is ~85% target pass at 4-5 columns, within ~10% of the weight-bandwidth floor
+  (22.2 ms for 4.9 GB, ~221 GB/s against a ~246 GB/s copy peak), and MTP draft steps cost ~1.3 ms. More speed there
+  needs more accepted tokens per round, a draft-quality question rather than a kernel one.
+- **Gated DeltaNet recurrence**: 16 ms of a 512-token chunk (6%). A chunked (WY / UT-transform) form could put it on
+  tensor cores, but at most ~5% of a chunk is left to win.
