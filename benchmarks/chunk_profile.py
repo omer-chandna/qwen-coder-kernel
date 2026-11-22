@@ -53,7 +53,7 @@ def main() -> None:
         fmt = ChatFormat(DEFAULT_MODEL)
         # frozen copy of qwen35_model.cu at 629018b, so turn sizes do not change as the source is edited
         src = (ROOT / "benchmarks" / "data" / "agent_source.txt").read_text(encoding="utf-8")
-        extras = [src[i:i + n] for i, n in ((30000, 300), (36000, 900), (42000, 1800), (52000, 3600))]
+        extras = [src[i:i + n] for i, n in ((30000, 300), (36000, 900), (42000, 1800), (52000, 3600), (20000, 40))]
         for rep in range(2):
             m.reset_cache()
             msgs = [{"role": "system", "content": "You are a coding agent. " + src[:18000]},

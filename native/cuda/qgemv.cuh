@@ -329,9 +329,10 @@ __device__ __forceinline__ void qgemv_dp4a_rows_mc(const uint8_t* W, const int8_
 #pragma unroll
             for (int c = 0; c < NC; ++c) acc[c] = 0.f;
             if (valid) {
-                // Wide variants keep one super-block in flight: unrolling them pushed Q4_K past 180 registers
-                // and cut occupancy (verify time jumped about 60% from T = 5 to T = 6).
-#pragma unroll 1
+                // One super-block in flight, except 5-7 columns: unrolling there helps now that wide variants get
+                // 128 registers (k_gemv_mc launch bounds), but it spills at 8-12 columns. At 64 registers unrolling
+                // had pushed Q4_K past 180 registers and cut occupancy (verify time jumped ~60% from T = 5 to 6).
+#pragma unroll (NC > 4 && NC < 8 ? 2 : 1)
                 for (int b = sub >> 3; b < nb; b += LPR / 8) {
                     if (type == 1) {
                         const Q4kLane L = q4k_lane(rowp + b * 144, t);

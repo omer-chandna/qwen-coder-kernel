@@ -66,7 +66,9 @@ constexpr int kAttnChunk = 256;  // keys per split-attention block
 constexpr int kMaxCols = 12;     // widest decode / verify pass: 1 + 11 drafts
 constexpr int kSub = 8;          // delta-rule columns staged in shared memory at a time
 constexpr int kPfCols = 1024;    // default prefill chunk (AK_Q35_PF_COLS overrides); 512 -> 1024 cut TTFT 14-22% on coding prompts
-constexpr int kPfMin = 24;       // shorter remainders go through the GEMV path
+constexpr int kPfMin = 9;        // ranges of <= 9 tokens go through the GEMV path (measured crossover: GEMV 9 / 10 / 12
+                                 // columns 36 / 38 / 45 ms, a 13-token GEMM chunk 38 ms; it was 24, so 13-24 tokens took two
+                                 // GEMV passes, >= 67 ms)
 
 // Recurrent-state snapshots taken inside a pass: after column col[i], k_conv / k_gdn also store the state of each
 // linear layer into base[i] (a prefix-cache slot, laid out as snap_copy does: per linear layer [conv 3 x C | gdn]).
@@ -434,8 +436,11 @@ __global__ void __launch_bounds__(1024) k_mtp_in(float* e, float* h, const float
 }
 
 // Multi-column dp4a GEMV, 128 threads per block. Optional second matrix W2: rows >= rows1 come from it.
+// Up to 4 columns a pass is bandwidth-bound and 8 blocks / SM (64 registers) hide DRAM latency; wider variants
+// (verify passes of 5-12 tokens) carry one accumulator per column and ran out of registers at 64, so they get
+// 4 blocks / SM (128 registers): 12 columns 50.3 -> 44.9 ms per target pass. 2 blocks (255) was worse.
 template <int type, int NC>
-__global__ void __launch_bounds__(128, 8) k_gemv_mc(const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq,
+__global__ void __launch_bounds__(128, (NC > 4 ? 4 : 8)) k_gemv_mc(const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq,
                                                     const float* xd, float* y, int ystride, int rows, int K) {
     constexpr int bb = type == 0 ? 34 : (type == 1 ? 144 : 210);
     const int nb = type == 0 ? (K >> 5) : (K >> 8);
@@ -2559,10 +2564,17 @@ extern "C" ak_status ak_q35_generate(ak_q35_model* m, const int32_t* prompt, int
 
 namespace {
 
+constexpr float kLaPrior = 0.9f;
+constexpr float kLaPull = 0.02f;
+
 // Speculation cost model and acceptance estimates, updated every round from GPU event timings.
 struct Policy {
     float acc[kMaxCols];                // P(MTP draft i accepted | draft i - 1 accepted), i >= 1
-    float la = 0.7f;                    // prompt-lookup acceptance per position
+    // Prompt-lookup acceptance per position. Only lookup rounds update it, so a pessimistic start meant lookup was
+    // never tried once MTP acceptance was high, and whether it ever got going (1.6x on code-copying output) came
+    // down to timing noise in the first rounds. Start optimistic (an n-gram match in code usually continues), and
+    // pull it back toward that prior in rounds where a match exists but MTP was chosen (kLaPrior / kLaPull).
+    float la = kLaPrior;
     int ng_len = 4;                     // current lookup proposal cap
     float verify_ms[kMaxCols + 1] = {};
     float first_ms = -1.f;              // MTP pass over the accepted pairs + head (first draft)
@@ -2715,6 +2727,8 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
                     if (expect_geo(pol.la, L) / (fill + est_verify(pol, L + 1)) > best) {
                         from_lookup = true;
                         k = L;
+                    } else {
+                        pol.la += kLaPull * (kLaPrior - pol.la);
                     }
                 }
             }

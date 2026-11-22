@@ -507,6 +507,82 @@ file's header moved a correlation from just above to just below the 0.9995 thres
 either way, so the prompt changed, not the kernels. Its prompt now comes from a frozen copy
 (`tests/data/long_prompt_source.txt`).
 
+## Decode: verify-pass cost, the draft policy, and the GEMV / GEMM threshold
+
+### Verify passes were compute-bound past 4 columns
+
+Every speculative round verifies 1 + k tokens in one multi-column GEMV pass (`k_gemv_mc`, the decode arithmetic,
+so speculative output stays bit-identical to greedy). One target pass, by width (`benchmarks/chunk_profile.py
+--sizes 1,...,12`):
+
+| columns | 1 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| before, ms | 22.2 | 23.0 | 25.1 | 27.3 | 31.1 | 35.4 | 39.8 | 42.0 | 45.9 | 50.3 |
+| after, ms | 22.2 | 23.1 | 24.1 | 27.0 | 31.4 | **32.0** | **35.9** | **38.4** | **42.1** | **44.9** |
+
+Up to 4 columns a pass is the 4.9 GB weight read (~22 ms). Each further column used to add ~4.2 ms of compute.
+Ruled out first, each by measuring it:
+- **The per-column activation sums** (`dp4a(ones, x)` for Q4_K's min term and Q6_K's -32 offset): half the dp4a
+  work, recomputed for every weight row. Removing them entirely (wrong results, timing only) saved only 8-12% at
+  8-12 columns, and precomputing them would have meant changing six activation-producer kernels. Not done.
+- **The four quarter-rate I2F conversions** per lane, column and super-block: replaced with the exact 2-op trick
+  plus `float(sc) * float(dot)` (bit-identical, since both factors and the product are exact in fp32). No
+  measurable change. Reverted.
+
+What did help was the register budget:
+- `__launch_bounds__(128, 8)` held every variant to 64 registers, which is right for <= 4 columns, where the pass
+  is bandwidth-bound and occupancy hides DRAM latency.
+- With 5-12 per-column accumulators live, 64 registers forced the compiler to serialize.
+- Wide variants now get 4 blocks per SM (128 registers).
+- 255 registers (2 blocks) was worse at 10-12 columns (204 registers used, half the occupancy), and 6 blocks
+  (85 registers) was in between.
+- With the extra registers, unrolling the super-block loop twice helps 5-7 columns but hurts 8-12, so only 5-7
+  unroll. (The original comment recorded that unrolling at 64 registers had cost 60%.)
+
+Exactness: launch bounds and unrolling do not reorder any float accumulation. The GEMV-path logits of a fixed prompt
+hash to the same sha256 before and after (`benchmarks/decode_bench.py` prints it), and generated tokens are
+identical.
+
+### The draft policy never tried prompt lookup on code
+
+`benchmarks/decode_bench.py`: three coding chat prompts over the frozen corpus, 256 tokens. On the "refactor" prompt,
+whose answer copies most of a function from the prompt, the same build gave 152-160 tok/s in some runs and
+250 tok/s in others, with identical tokens. The difference was whether prompt-lookup drafts were used: 1 lookup
+round against 24.
+
+The per-request policy is a small bandit:
+- It drafts from prompt lookup when `expect_geo(la, L) / (fill + verify(L + 1))` beats the best MTP plan.
+- `la` (lookup acceptance per position) started at 0.7 and was only updated in rounds that used lookup.
+- On code, MTP acceptance quickly rises to ~0.9+, so a lookup plan priced at 0.7 always lost. Lookup was never
+  tried, and `la` never learned that copied code goes on matching for 10+ tokens.
+- Whether it got tried once early (after which it snowballs: acceptance, then `ng_len`, grow) depended on timing
+  noise in the first rounds.
+
+Fix (`Policy`, `kLaPrior` / `kLaPull`):
+- `la` starts at 0.9: an n-gram match in code usually continues.
+- In rounds where a match exists but MTP is chosen, `la` is pulled 2% toward that prior, so a context that turns
+  copy-heavy later gets re-probed instead of written off.
+
+A failed probe costs about one round. The output cannot change, since every draft is verified against greedy; only
+speed can.
+
+Results (interleaved runs against `main` at 0efee76, 3 reps each, two rounds; tokens identical in every run):
+
+| prompt | before | policy only | policy + GEMV registers |
+|---|---:|---:|---:|
+| write tests (2368 tokens) | 88.6 tok/s | 90.2 | 89.5 |
+| refactor (1138) | 148-158 | 226 | **250** (10.6 tokens per round) |
+| explain (1680) | 95.7 | 94.4 | **98.7** |
+
+Raw: `experiments/results/decode_base_{0,1}.json`, `decode_new_{0,1}.json`, `decode_policy_only.json`.
+
+### GEMV / GEMM threshold for prompt ranges (`kPfMin` 24 -> 9)
+
+From the same pass costs: 9 / 10 / 12 GEMV columns take 36 / 38 / 45 ms, and a 13-token batched GEMM chunk 38 ms.
+With the old threshold of 24, a range of 13-24 new tokens took two GEMV passes (>= 67 ms). Ranges of 10 or more
+tokens now go through one GEMM pass. A follow-up turn that adds 22 tokens (a short user reply): **93.5 -> 46.6 ms**.
+Turns of 29+ tokens already used the GEMM path and are unchanged (`experiments/results/ab_round3/`).
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around
@@ -514,6 +590,7 @@ either way, so the prompt changed, not the kernels. Its prompt now comes from a 
   or per thread in registers, would remove one barrier per stage.
 - **Gated DeltaNet recurrence**: 43 ms of a 512-token chunk (15%) and ~20% of short chunks, the next largest item.
   A chunked (WY / UT-transform) formulation would move most of it onto tensor cores.
-- **The GEMV / GEMM threshold** (`kPfMin` = 24): a whole new range of 13-24 tokens still takes two GEMV passes
-  (~44 ms). If a 24-token GEMM chunk is cheaper (likely, since its fixed cost is the ~22 ms weight read), lower it.
+- **Verify passes past 4 columns** still add ~3-4 ms per column (44.9 ms at 12). Speculative decoding on code now
+  often runs 10-12-column passes, so a cheaper wide verify converts directly into tok/s. It must stay bit-identical to
+  the T = 1 decode path, which rules out tensor cores unless decode moves to the same arithmetic.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.
