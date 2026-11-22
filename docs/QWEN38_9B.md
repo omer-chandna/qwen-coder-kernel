@@ -583,13 +583,66 @@ With the old threshold of 24, a range of 13-24 new tokens took two GEMV passes (
 tokens now go through one GEMM pass. A follow-up turn that adds 22 tokens (a short user reply): **93.5 -> 46.6 ms**.
 Turns of 29+ tokens already used the GEMM path and are unchanged (`experiments/results/ab_round3/`).
 
+## Delta-rule kernel (`k_gdn`): 43.9 -> 16.3 ms per 512-token chunk
+
+The Gated DeltaNet recurrence was the second-largest prefill cost (15% of a chunk) and runs on every decode and
+verify pass. Per layer and token it updates a 128 x 128 fp32 state per value head:
+S *= decay; S += k (v - S.k) beta; o = S.q.
+It is sequential over tokens, so it is all about latency: ~3.6 us per token per layer, while the instructions it
+issues need ~140 cycles per block.
+
+Three steps, each measured (`benchmarks/chunk_profile.py`, ms of `gated_delta` per pass):
+
+| version | T = 1 | 12 | 64 | 512 |
+|---|---:|---:|---:|---:|
+| original: 2 rows per warp, 32 lanes per row, rows one after another | 0.35 | 1.22 | 5.69 | 43.9 |
+| 1. one warp per staged column, rows interleaved | 0.37 | 0.96 | 3.86 | 31.2 |
+| 2. 4 rows per warp (128 blocks, one wave) | 0.36 | 0.90 | 3.44 | 27.1 |
+| 3. 8 lanes per row, 4 rows reduced together | 0.35 | **0.62** | **2.12** | **16.3** |
+
+1. **Staging without block barriers.** Each staged token's q and k get an L2 norm. The original reduced each norm
+   across 4 warps through shared memory, which took 2 `__syncthreads` per token. Now warp `cc` normalizes token
+   `c0 + cc` on its own (`kSub` = 8 = warps per block). Lane l holds dims l + 32 i, so the four 32-lane reductions
+   cover exactly the element sets the old four warps reduced, added in the same order: bit-identical.
+   **Interleaved rows:** the loop was `for row { for token }`, so a warp's two rows ran their dependent
+   reduce -> update -> reduce chains back to back. `for token { for row }` overlaps them. Same per-row operation
+   order: bit-identical.
+2. **4 rows per warp.** 256 blocks x 8 warps (85 warps per SM) needed two waves on 24 SMs, and every block
+   re-staged its head's q / k norms. 128 blocks fit in one wave, each warp has twice the independent chains, and
+   the redundant staging halves. Still bit-identical.
+3. **8 lanes per row.** With 32 lanes per row, each of a row's two 128-dim dot products per token is a 5-step
+   shuffle reduction: 40 shuffles per warp and token for 4 rows. Shuffles issue at one warp-instruction per clock
+   per SM, so they were the limit. Now each lane holds 16 dims of one row (4 float4), and a warp's 4 rows are
+   reduced together in 3 steps over 8 lanes: 6 shuffles per token, with the same FMA count and registers.
+   - Lane `sub` holds dims 32 q + 4 sub .. +3 rather than 16 contiguous dims: with contiguous dims, the 8 distinct
+     float4 reads of a key vector would fall on the same banks 4 ways. With the interleave they land on banks
+     0, 4, ..., 28.
+   - This step changes the summation order of each dot product, so results are no longer bit-identical to the
+     earlier builds. They are still the same in decode, verify and prefill (one kernel), so speculative output
+     still equals greedy (all tests pass).
+   - Checked against the reference implementation (`benchmarks/llama_match.py`: 6 prompts x 64 greedy tokens
+     against `llama-completion --temp 0`). Before, 4 of 6 prompts agreed fully (1310 characters). After, all 6
+     agree fully (1351). Near-tied logits flip either way under rounding changes; this one happens to land closer
+     to llama.cpp.
+
+End to end (agent replay, interleaved against `main` at 844110d, two rounds each):
+
+| turn (new tokens) | before | after |
+|---|---:|---:|
+| first, 5968 | 3.86 s | **3.56 s** (-8%) |
+| follow-up, 148 / 375 / 748 / 1446 | 0.146 / 0.243 / 0.488 / 1.011 s | **0.138 / 0.222 / 0.449 / 0.930 s** |
+
+A 512-token chunk at position 0 now takes 273 ms: matrix products 232 (85%), delta rule 16, the rest 25. So the
+int8 GEMMs are again the main cost of prompt reading, and at long context attention joins them.
+Raw: `experiments/results/ab_gdn/`.
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around
   a cooperative scale-decode phase that the tensor cores sit out. Decoding the scales for stage t+1 during stage t,
   or per thread in registers, would remove one barrier per stage.
-- **Gated DeltaNet recurrence**: 43 ms of a 512-token chunk (15%) and ~20% of short chunks, the next largest item.
-  A chunked (WY / UT-transform) formulation would move most of it onto tensor cores.
+- **Gated DeltaNet recurrence**: now 16 ms of a 512-token chunk (6%). A chunked (WY / UT-transform) formulation could
+  put it on tensor cores, but at most ~5% of a chunk is left to win.
 - **Verify passes past 4 columns** still add ~3-4 ms per column (44.9 ms at 12). Speculative decoding on code now
   often runs 10-12-column passes, so a cheaper wide verify converts directly into tok/s. It must stay bit-identical to
   the T = 1 decode path, which rules out tensor cores unless decode moves to the same arithmetic.

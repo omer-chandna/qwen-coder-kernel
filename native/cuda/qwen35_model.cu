@@ -511,24 +511,52 @@ __global__ void k_conv(const float* in, int in_stride, float* state, float* save
     }
 }
 
-// One delta-rule step on a warp's state row (lanes hold 4 key dims each): S *= decay; S += k (v - S.k) beta.
-__device__ __forceinline__ void gdn_step(float4& mm, const float4 kk, float decay, float beta, float vj) {
-    mm.x *= decay;
-    mm.y *= decay;
-    mm.z *= decay;
-    mm.w *= decay;
-    const float sk = xor_sum(mm.x * kk.x + mm.y * kk.y + mm.z * kk.z + mm.w * kk.w);
-    const float delta = (vj - sk) * beta;
-    mm.x += kk.x * delta;
-    mm.y += kk.y * delta;
-    mm.z += kk.z * delta;
-    mm.w += kk.w * delta;
+// 8-lane sum (the lanes of one state row in k_gdn): xor 4, 2, 1 stays inside the aligned 8-lane group.
+__device__ __forceinline__ float sum8(float v) {
+    v += __shfl_xor_sync(0xffffffff, v, 4);
+    v += __shfl_xor_sync(0xffffffff, v, 2);
+    v += __shfl_xor_sync(0xffffffff, v, 1);
+    return v;
 }
 
-// Gated delta rule over T tokens. grid (Hv, kDk / 16), 256 threads: each warp owns two state rows j (value dims) of
-// head h for the whole pass (held in registers), lanes hold four consecutive key dims. Value head h reads key/query
-// head h % Hk (ggml layout). conv columns (C apart): [q Hk*128 | k Hk*128 | v Hv*128]; ab columns (2 Hv apart):
-// [alpha | beta]. Columns are staged kSub at a time. Replay / save as in k_conv.
+// One delta-rule step on a state row held by 8 lanes (16 key dims each, as 4 float4 at dims 32 q + 4 sub):
+// S *= decay; S += k (v - S.k) beta.
+__device__ __forceinline__ void gdn_step8(float4* m, const float4* kk, float decay, float beta, float vj) {
+    float sk = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        m[q].x *= decay;
+        m[q].y *= decay;
+        m[q].z *= decay;
+        m[q].w *= decay;
+        sk += m[q].x * kk[q].x + m[q].y * kk[q].y + m[q].z * kk[q].z + m[q].w * kk[q].w;
+    }
+    const float delta = (vj - sum8(sk)) * beta;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        m[q].x += kk[q].x * delta;
+        m[q].y += kk[q].y * delta;
+        m[q].z += kk[q].z * delta;
+        m[q].w += kk[q].w * delta;
+    }
+}
+
+__device__ __forceinline__ float dot8(const float4* m, const float4* qq) {
+    float o = 0.f;
+#pragma unroll
+    for (int q = 0; q < 4; ++q) o += m[q].x * qq[q].x + m[q].y * qq[q].y + m[q].z * qq[q].z + m[q].w * qq[q].w;
+    return sum8(o);
+}
+
+// Gated delta rule over T tokens. grid (Hv, kDk / 32), 256 threads. Each warp owns 4 state rows j (value dims) of
+// head h for the whole pass, held in registers: 8 lanes per row, lane sub holding key dims 32 q + 4 sub .. +3 for
+// q = 0..3 (that interleave keeps the 8 distinct float4 reads of a key / query vector on 8 different bank groups).
+// So a row's two 128-dim reductions per token are 3 shuffle steps over 8 lanes, done for the warp's 4 rows at once:
+// 6 shuffles per warp and token, against 40 with one row per 32 lanes (2 rows per warp: 20), and shuffles issue at
+// one warp-instruction per clock per SM. Value head h reads key/query head h % Hk (ggml layout). conv columns (C
+// apart): [q Hk*128 | k Hk*128 | v Hv*128]; ab columns (2 Hv apart): [alpha | beta]. Columns are staged kSub at a
+// time. Replay / save as in k_conv.
+constexpr int kGdnRows = 32;  // state rows per block (8 warps x 4)
 template <bool SNAP>  // as k_conv
 __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const float* ab, const float* dt_bias,
                                              const float* ssm_a, float* state, float* k_save, float* v_save,
@@ -536,22 +564,27 @@ __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const flo
                                              int Hv, float eps, int T, int save_mode, SnapReq sr, size_t sr_off) {
     __shared__ __align__(16) float qs[kSub][kDk];
     __shared__ __align__(16) float ks[kSub][kDk];
-    __shared__ float vs[kSub][16];
-    __shared__ float red[8];
+    __shared__ float vs[kSub][kGdnRows];
     __shared__ float sdecay[kSub], sbeta[kSub];
     const int h = blockIdx.x;
     const int kh = h % Hk;
     const int tid = threadIdx.x;
     const int lane = tid & 31;
     const int warp = tid >> 5;
-    const int j0 = blockIdx.y * 16;
+    const int g = lane >> 3;    // row of the warp's four
+    const int sub = lane & 7;   // lane within the row
+    const int rl = warp * 4 + g;  // row within the block
+    const int j = blockIdx.y * kGdnRows + rl;
+    const int d0 = sub * 4;     // first key dim of float4 q is d0 + 32 q
     const size_t col_n = static_cast<size_t>(Hv) * kDk;  // per-column stride of k_save / v_save
-    float* S = state + static_cast<size_t>(h) * kDk * kDk;
-    float4 mm[2];
+    float* Srow = state + (static_cast<size_t>(h) * kDk + j) * kDk;
+    float4 m[4];
 #pragma unroll
-    for (int r = 0; r < 2; ++r) {
-        mm[r] = reinterpret_cast<const float4*>(S + static_cast<size_t>(j0 + warp * 2 + r) * kDk)[lane];
-    }
+    for (int q = 0; q < 4; ++q) m[q] = *reinterpret_cast<const float4*>(Srow + d0 + 32 * q);
+    auto load4 = [&](const float* v, float4* dst) {
+#pragma unroll
+        for (int q = 0; q < 4; ++q) dst[q] = *reinterpret_cast<const float4*>(v + d0 + 32 * q);
+    };
     const int par = ctl[kCtlPar];
     const int nc = ctl[kCtlCommit];
     {
@@ -559,46 +592,55 @@ __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const flo
         const float* vp = v_save + static_cast<size_t>(par) * kMaxCols * col_n;
         const float* dp = db_save + static_cast<size_t>(par) * kMaxCols * 2 * Hv;
         for (int i = 0; i < nc; ++i) {
-            const float4 kk = reinterpret_cast<const float4*>(kp + i * col_n + h * kDk)[lane];
-            const float decay = dp[i * 2 * Hv + h];
-            const float beta = dp[i * 2 * Hv + Hv + h];
-#pragma unroll
-            for (int r = 0; r < 2; ++r) gdn_step(mm[r], kk, decay, beta, vp[i * col_n + h * kDk + j0 + warp * 2 + r]);
+            float4 kk[4];
+            load4(kp + i * col_n + h * kDk, kk);
+            gdn_step8(m, kk, dp[i * 2 * Hv + h], dp[i * 2 * Hv + Hv + h], vp[i * col_n + h * kDk + j]);
         }
         if (save_mode && nc > 0) {
 #pragma unroll
-            for (int r = 0; r < 2; ++r) {
-                reinterpret_cast<float4*>(S + static_cast<size_t>(j0 + warp * 2 + r) * kDk)[lane] = mm[r];
-            }
+            for (int q = 0; q < 4; ++q) *reinterpret_cast<float4*>(Srow + d0 + 32 * q) = m[q];
         }
     }
     float* kd = k_save + static_cast<size_t>(par ^ 1) * kMaxCols * col_n;
     float* vd = v_save + static_cast<size_t>(par ^ 1) * kMaxCols * col_n;
     float* dd = db_save + static_cast<size_t>(par ^ 1) * kMaxCols * 2 * Hv;
     const float scale = rsqrtf(static_cast<float>(kDk));
+    const int jb = blockIdx.y * kGdnRows;
+    static_assert(kSub == 8, "k_gdn stages one column per warp (256 threads)");
     for (int c0 = 0; c0 < T; c0 += kSub) {
         const int n = min(kSub, T - c0);
         __syncthreads();  // the previous group's shared values are no longer read
-        for (int cc = 0; cc < n; ++cc) {
+        // Staging: warp cc normalizes column c0 + cc on its own (no block-wide barrier per column). Lane l holds
+        // dims l + 32 i; the four 32-lane partial sums are added in a fixed order.
+        if (warp < n) {
+            const int cc = warp;
             const int c = c0 + cc;
             const float* col = conv + static_cast<size_t>(c) * C;
-            const float raw = tid < kDk ? col[kh * kDk + tid] : col[Hk * kDk + kh * kDk + (tid - kDk)];
-            const float ss = xor_sum(raw * raw);
-            if (lane == 0) red[warp] = ss;
-            __syncthreads();
-            const int g0 = tid < kDk ? 0 : 4;
-            const float tot = red[g0] + red[g0 + 1] + red[g0 + 2] + red[g0 + 3];
-            // L2 norm as ggml builds it: rms_norm(x, eps / n) / sqrt(n) == x / sqrt(sum x^2 + eps).
-            const float nv = raw * rsqrtf(tot + eps);
-            if (tid < kDk) qs[cc][tid] = nv;
-            else ks[cc][tid - kDk] = nv;
-            if (tid < 16) {
-                const float vv = col[2 * Hk * kDk + h * kDk + j0 + tid];
-                vs[cc][tid] = vv;
-                if (save_mode) vd[c * col_n + h * kDk + j0 + tid] = vv;
+            float rq[4], rk[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                rq[i] = col[kh * kDk + lane + 32 * i];
+                rk[i] = col[Hk * kDk + kh * kDk + lane + 32 * i];
             }
-            if (save_mode && blockIdx.y == 0 && tid >= kDk) kd[c * col_n + h * kDk + (tid - kDk)] = nv;
-            if (tid == 0) {
+            float tq = 0.f, tk = 0.f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                tq += xor_sum(rq[i] * rq[i]);
+                tk += xor_sum(rk[i] * rk[i]);
+            }
+            // L2 norm as ggml builds it: rms_norm(x, eps / n) / sqrt(n) == x / sqrt(sum x^2 + eps).
+            const float iq = rsqrtf(tq + eps), ik = rsqrtf(tk + eps);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float nk = rk[i] * ik;
+                qs[cc][lane + 32 * i] = rq[i] * iq;
+                ks[cc][lane + 32 * i] = nk;
+                if (save_mode && blockIdx.y == 0) kd[c * col_n + h * kDk + lane + 32 * i] = nk;
+            }
+            const float vv = col[2 * Hk * kDk + h * kDk + jb + lane];  // kGdnRows == 32 values, one per lane
+            vs[cc][lane] = vv;
+            if (save_mode) vd[c * col_n + h * kDk + jb + lane] = vv;
+            if (lane == 0) {
                 const float* abc = ab + static_cast<size_t>(c) * 2 * Hv;
                 const float a = abc[h] + dt_bias[h];
                 const float sp = a > 20.f ? a : logf(1.f + expf(a));
@@ -611,30 +653,26 @@ __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const flo
                     dd[c * 2 * Hv + Hv + h] = beta;
                 }
             }
-            __syncthreads();
         }
+        __syncthreads();
+        for (int cc = 0; cc < n; ++cc) {
+            float4 kk[4], qq[4];
+            load4(ks[cc], kk);
+            load4(qs[cc], qq);
+            gdn_step8(m, kk, sdecay[cc], sbeta[cc], vs[cc][rl]);
+            const float oj = dot8(m, qq);
+            if (sub == 0) out[static_cast<size_t>(c0 + cc) * out_stride + h * kDk + j] = oj * scale;
+            for (int i = 0; SNAP && i < sr.n; ++i) {
+                if (sr.col[i] != c0 + cc) continue;
+                float* dst = sr.base[i] + sr_off + (static_cast<size_t>(h) * kDk + j) * kDk;
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            const int j = j0 + warp * 2 + r;
-            for (int cc = 0; cc < n; ++cc) {
-                const float4 kk = reinterpret_cast<const float4*>(ks[cc])[lane];
-                const float4 qq = reinterpret_cast<const float4*>(qs[cc])[lane];
-                gdn_step(mm[r], kk, sdecay[cc], sbeta[cc], vs[cc][warp * 2 + r]);
-                const float oj = xor_sum(mm[r].x * qq.x + mm[r].y * qq.y + mm[r].z * qq.z + mm[r].w * qq.w);
-                if (lane == 0) out[static_cast<size_t>(c0 + cc) * out_stride + h * kDk + j] = oj * scale;
-                for (int i = 0; SNAP && i < sr.n; ++i) {
-                    if (sr.col[i] != c0 + cc) continue;
-                    reinterpret_cast<float4*>(sr.base[i] + sr_off + (static_cast<size_t>(h) * kDk + j) * kDk)[lane] =
-                        mm[r];
-                }
+                for (int q = 0; q < 4; ++q) *reinterpret_cast<float4*>(dst + d0 + 32 * q) = m[q];
             }
         }
     }
     if (!save_mode) {
 #pragma unroll
-        for (int r = 0; r < 2; ++r) {
-            reinterpret_cast<float4*>(S + static_cast<size_t>(j0 + warp * 2 + r) * kDk)[lane] = mm[r];
-        }
+        for (int q = 0; q < 4; ++q) *reinterpret_cast<float4*>(Srow + d0 + 32 * q) = m[q];
     }
 }
 
@@ -1775,7 +1813,7 @@ ak_status emit_target(ak_q35_model* m, const Bufs& b, int T, int save_mode, Prof
                 qkv, m->big_n, L.conv_state, L.conv_save, ctl, L.conv_w, b.conv_out, m->conv_ch, T, save_mode, sr,
                 sr_off);
             mark(p, s, kKConv);
-            (sr.n ? k_gdn<true> : k_gdn<false>)<<<dim3(m->hv, kDk / 16), 256, 0, s>>>(
+            (sr.n ? k_gdn<true> : k_gdn<false>)<<<dim3(m->hv, kDk / kGdnRows), 256, 0, s>>>(
                 b.conv_out, m->conv_ch, b.ab, L.dt_bias, L.ssm_a, L.gdn_state, L.k_save, L.v_save, L.db_save, ctl,
                 b.o, m->d_inner, m->hk, m->hv, m->eps, T, save_mode, sr, sr_off + snap_nc);
             mark(p, s, kKGdn);
