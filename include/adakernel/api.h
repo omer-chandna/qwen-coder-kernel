@@ -447,6 +447,8 @@ AK_API ak_status ak_q35_cache_load(ak_q35_model* model, int slot);
    1 = never split). A split changes the float summation order, so a token's activations then depend slightly on
    the chunk length it was processed in. */
 AK_API ak_status ak_q35_set_splitk(ak_q35_model* model, int max_split);
+/* Prefill FFN: 1 (default) gate + up + SiLU in one fused int8 GEMM, 0 two GEMMs plus k_silu_quant (bit-identical). */
+AK_API ak_status ak_q35_set_glu(ak_q35_model* model, int on);
 /* Save the current recurrent state into a slot. */
 AK_API ak_status ak_q35_cache_save(ak_q35_model* model, int slot);
 /* Copy up to n floats of a slot's saved recurrent state to out (host); *n_total gets the slot size in floats.

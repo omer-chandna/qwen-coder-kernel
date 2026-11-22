@@ -673,10 +673,15 @@ __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_gr
 //   1 = the per-sub-block float epilogue reduced to one add per output, 2 = no min term,
 //   4 = no mma either (loads, syncs and fragment reads only), 5 = no global -> shared copies (compute only),
 //   6 = no per-stage scale decode and no barrier after it.
-template <int BN, int S, int MB = 1, int DIAG = 0>
+// GLU (FFN gate + up + SiLU in one launch): W is the gate matrix, Wu the up matrix (same shape), rows their row
+// count. Each warp's 32-row slab is 16 gate rows and the same 16 up rows, so m-tile 0 holds gate and m-tile 1 up for
+// the same outputs in the same thread, and the epilogue writes fp16 silu(gate) * up to Y (as __half, ldy apart)
+// instead of two fp32 results that k_silu_quant would read back. A block covers BM / 2 = 64 rows. The accumulation is
+// k_mmq4's, and silu * up is k_silu_quant's expression, so the fp16 output is bit-identical to the two-step path.
+template <int BN, int S, int MB = 1, int DIAG = 0, bool GLU = false>
 __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t* xq, const float* xd,
                                                const float* xsd, float* Y, int rows, int K, int T, int ldy,
-                                               int nsplit) {
+                                               int nsplit, const uint8_t* Wu = nullptr) {
     constexpr int TW = BN / 2;   // tokens per warp
     constexpr int NTW = TW / 8;
     constexpr size_t SB = p4_stage_bytes<BN>();
@@ -690,9 +695,19 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
     const int wm = warp >> 1;
     const int wn = warp & 1;
     const int c0 = blockIdx.x * BN;
-    const int r0 = blockIdx.y * BM;
+    const int r0 = blockIdx.y * (GLU ? BM / 2 : BM);
     const int KB = K / 32;
     const size_t row_bytes = static_cast<size_t>(K / 256) * 144;
+    // Tile row tr -> matrix row: plain, tr; GLU, slab tr / 32 holds 16 gate rows then the same 16 up rows.
+    auto src_row = [&](int tr, const uint8_t*& mat) {
+        if constexpr (GLU) {
+            mat = (tr & 16) ? Wu : W;
+            return (tr >> 5) * 16 + (tr & 15);
+        } else {
+            mat = W;
+            return tr;
+        }
+    };
     // Split-K: block z covers stages [kt0, kt0 + nk) and writes its partial sums to plane z of Y (k_splitk_sum
     // adds the planes in a fixed order, so results are deterministic).
     const int nk = K / P4_BK / nsplit;
@@ -712,8 +727,10 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
         uint8_t* ws = wraw(st);
         for (int i = tid; i < BM * 5; i += NT) {
             const int r = i / 5, ch = i - r * 5;
-            const bool ok = r0 + r < rows;
-            const uint8_t* blk = W + (ok ? (r0 + r) * row_bytes : 0) + b * 144;
+            const uint8_t* mat;
+            const int mr = r0 + src_row(r, mat);
+            const bool ok = mr < rows;
+            const uint8_t* blk = mat + (ok ? mr * row_bytes : 0) + b * 144;
             cp_async16(ws + r * P4_WS + ch * 16, ch == 0 ? blk : blk + 16 + h * 64 + (ch - 1) * 16, ok);
         }
         int8_t* xs = xsm(st);
@@ -846,6 +863,23 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
     }
     cp_async_wait<0>();
 
+    if constexpr (GLU) {
+        __half* Yh = reinterpret_cast<__half*>(Y);
+#pragma unroll
+        for (int nt = 0; nt < NTW; ++nt) {
+            const int r = r0 + wm * 16 + gq;
+            const int c = c0 + wn * TW + nt * 8 + tig * 2;
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int rr = r + (e >> 1) * 8;
+                const int cc = c + (e & 1);
+                const float g = acc[0][nt][e];
+                const float sg = 1.f / (1.f + expf(-g));  // sigmoidf, as in k_silu_quant
+                if (rr < rows && cc < T) Yh[static_cast<size_t>(cc) * ldy + rr] = __float2half(g * sg * acc[1][nt][e]);
+            }
+        }
+        return;
+    }
 #pragma unroll
     for (int mt = 0; mt < 2; ++mt) {
 #pragma unroll

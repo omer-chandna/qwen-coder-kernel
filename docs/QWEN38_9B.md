@@ -729,6 +729,39 @@ Decode tok/s, interleaved runs against `main` at afc866c (2 x 2 reps; tokens ide
 second token. Tuning further against six prompts would be overfitting, so it is left as is.
 Raw: `experiments/results/decode_pol_base_{0,1}.json` (main) and `decode_gate2_{0,1}.json` (final).
 
+## Fused FFN gate + up + SiLU (prefill), and a rejected epilogue rewrite
+
+**Fusion (`k_mmq4<..., GLU = true>`, the default; `set_glu(False)` / `AK_Q35_GLU=0` off).** In a prefill chunk the
+FFN gate and up GEMMs wrote 2 x 12288 fp32 values per token, and `k_silu_quant` read them all back to write fp16
+silu(gate) * up for the down projection: ~100 MB of traffic per layer for 512 tokens.
+
+The fused kernel:
+- gives each warp's 32-row slab 16 gate rows and the same 16 up rows, so m-tile 0 holds gate and m-tile 1 holds up
+  for the same outputs, in the same thread;
+- applies `g * sigmoidf(g) * u` in registers and writes only the fp16 product.
+
+The accumulation is k_mmq4's and the expression is k_silu_quant's, so the output is bit-identical
+(`test_fused_glu_matches_unfused`, 64- and 128-token tile paths).
+
+| chunk | unfused | fused |
+|---|---:|---:|
+| 64 tokens | 45.8 ms | 43.7 ms (-4.6%) |
+| 128 | 70.1 | 68.6 (-2%) |
+| 512 | 272.5 | 269.3 (-1.2%) |
+
+`k_silu_quant` and its traffic go away (-8.6 ms of "rest" at 512 tokens), but the fused GEMM is ~5 ms slower than
+the two separate launches: each block now streams two weight matrices. The net is small; it is kept because it is
+exact and helps the short chunks of agent follow-ups most. Agent replay: first turn 3.56 -> 3.50 s, a 375-token
+follow-up 0.222 -> 0.213 s (`experiments/results/turns_glu.json`).
+
+**Rejected: a regrouped K-quant GEMV epilogue.** The Q4_K dot product's float part,
+`dm.x (x0 sc0 dl + x1 sc1 dh) - dm.y (x0 m0 sl + x1 m1 sh)`, can be rewritten with d * sc and dmin * m precomputed
+per row and the activation sums per column: 2 conversions + 6 float ops instead of 4 IMUL + 4 I2F + 11. That changes
+rounding, so decode and verify would both need it (they share `q4k_col`). Measured after the shared-activation
+change: 8 / 10 / 12 columns went 25.1 / 27.2 / 30.4 -> 24.2 / 26.8 / 31.9 ms, within noise. A change to the decode
+arithmetic has to earn its place, so it was reverted. With activations shared across rows, the epilogue is no
+longer what limits wide verify.
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around

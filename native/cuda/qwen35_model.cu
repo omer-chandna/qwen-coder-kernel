@@ -318,6 +318,7 @@ struct ak_q35_model {
     size_t splitk_n = 0;                 // its size in floats
     int splitk_max = 4;                  // most K splits per int8 GEMM (AK_Q35_SPLITK; 1 = off)
     int n_sm = 0;                        // streaming multiprocessors on the device
+    bool glu = true;                     // prefill FFN gate + up + SiLU fused into one int8 GEMM (AK_Q35_GLU=0: off)
     SnapReq snapreq{};                   // snapshots the next target pass takes (n = 0: none)
     int qdiag = 0;                       // AK_Q35_QDIAG: 1 = the plain int8 kernel skips the math (timing only),
                                          // 2 = Q4_K uses the plain int8 kernel instead of the pipelined one
@@ -1643,6 +1644,23 @@ void mmq_dispatch(const QMat& W, const int8_t* xq, const float* xd, const float*
     else mmq_launch<64, 3, 1>(W, xq, xd, xsd, y, T, ldy, nsplit, s);
 }
 
+// Fused FFN gate + up + SiLU (k_mmq4<..., GLU>): fp16 silu(gate) * up of T columns into o16 (ff apart). Activations
+// must already be quantized (xq8 / xd8 / xsd8).
+template <int BN, int S>
+void glu_launch(const QMat& G, const QMat& U, const int8_t* xq, const float* xd, const float* xsd, __half* o16, int T,
+                cudaStream_t s) {
+    using namespace akd::qgemm;
+    static bool init = false;
+    if (!init) {
+        cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq4<BN, S, 1, 0, true>),
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p4_smem_bytes<BN, S>()));
+        init = true;
+    }
+    const dim3 g((T + BN - 1) / BN, (G.rows + BM / 2 - 1) / (BM / 2), 1);
+    k_mmq4<BN, S, 1, 0, true><<<g, NT, p4_smem_bytes<BN, S>(), s>>>(G.w, xq, xd, xsd, reinterpret_cast<float*>(o16),
+                                                                     G.rows, G.K, T, G.rows, 1, U.w);
+}
+
 // K splits for one int8 GEMM launch. Blocks run one per SM, so a grid of `blocks` takes ceil(blocks / n_sm) waves;
 // with 4096-row matrices and short chunks that is 1.33 or 2.67 waves, and the last wave leaves most SMs idle.
 // Splitting K into z parts makes z times as many blocks, each 1/z as long: time ~ ceil(z * blocks / slots) / z.
@@ -1783,10 +1801,23 @@ ak_status emit_ffn(ak_q35_model* m, const Bufs& b, const Layer& L, int T, Prof* 
     const Act hq = act_hq(b), fq = act_fq(b);
     k_norm<<<T, 1024, 0, s>>>(b.x, b.proj, L.post_norm, hq.q, hq.d, hq.h, m->d, m->eps, nullptr);
     mark(p, s, kKNorm);
-    ak_status st = mm2(m, b, L.wgate, L.wup, hq, b.gu, 2 * m->ff, T);
-    mark(p, s, kKGemvGateUp);
-    k_silu_quant<<<dim3(m->ff / 256, T), 256, 0, s>>>(b.gu, fq.q, fq.d, fq.h, m->ff);
-    mark(p, s, kKSilu);
+    ak_status st = AK_OK;
+    const bool glu = b.pf && m->glu && m->int8_gemm && T <= m->int8_max && L.wgate.type == 1 && L.wup.type == 1 &&
+                     L.wgate.K == L.wup.K && L.wgate.rows == L.wup.rows && L.wgate.K % 256 == 0;
+    if (glu) {  // gate + up + SiLU in one GEMM, straight to the fp16 down-projection input
+        using namespace akd::qgemm;
+        k_quant_x8<<<dim3(L.wgate.K / 256, T), 256, 0, s>>>(hq.h, L.wgate.K, m->xq8, m->xd8, m->xsd8);
+        const int cfg = T <= 64 ? m->mmq_short : m->mmq_long;
+        if (cfg == 2) glu_launch<128, 2>(L.wgate, L.wup, m->xq8, m->xd8, m->xsd8, fq.h, T, s);
+        else glu_launch<64, 3>(L.wgate, L.wup, m->xq8, m->xd8, m->xsd8, fq.h, T, s);
+        st = ck(cudaGetLastError());
+        mark(p, s, kKGemvGateUp);
+    } else {
+        st = mm2(m, b, L.wgate, L.wup, hq, b.gu, 2 * m->ff, T);
+        mark(p, s, kKGemvGateUp);
+        k_silu_quant<<<dim3(m->ff / 256, T), 256, 0, s>>>(b.gu, fq.q, fq.d, fq.h, m->ff);
+        mark(p, s, kKSilu);
+    }
     if (st == AK_OK) st = mm(m, b, L.wdown, nullptr, fq, b.proj, m->d, T);
     mark(p, s, kKGemvDown);
     return st;
@@ -2096,6 +2127,8 @@ ak_status ensure_pf(ak_q35_model* m) {
         if (ms) m->mmq_short = std::atoi(ms);
         const char* ml = std::getenv("AK_Q35_MMQ_LONG");
         if (ml) m->mmq_long = std::atoi(ml);
+        const char* gl = std::getenv("AK_Q35_GLU");
+        if (gl) m->glu = gl[0] != '0';
         const char* sk = std::getenv("AK_Q35_SPLITK");
         if (sk) m->splitk_max = std::max(1, std::atoi(sk));
         int dev = 0;
@@ -2977,6 +3010,15 @@ extern "C" ak_status ak_q35_cache_load(ak_q35_model* m, int slot) {
         return AK_ERR_INVALID;
     }
     return snap_copy(m, slot, false);
+}
+
+extern "C" ak_status ak_q35_set_glu(ak_q35_model* m, int on) {
+    if (!m) {
+        ak_set_error("qwen35 set_glu: null model");
+        return AK_ERR_INVALID;
+    }
+    m->glu = on != 0;
+    return AK_OK;
 }
 
 extern "C" ak_status ak_q35_set_splitk(ak_q35_model* m, int max_split) {

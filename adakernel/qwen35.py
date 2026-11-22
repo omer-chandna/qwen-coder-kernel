@@ -97,6 +97,8 @@ def _bind(lib) -> None:
     lib.ak_q35_generate_spec_ex.restype = ctypes.c_int
     lib.ak_q35_cache_load.argtypes = [vp, ctypes.c_int]
     lib.ak_q35_cache_load.restype = ctypes.c_int
+    lib.ak_q35_set_glu.argtypes = [vp, ctypes.c_int]
+    lib.ak_q35_set_glu.restype = ctypes.c_int
     lib.ak_q35_set_splitk.argtypes = [vp, ctypes.c_int]
     lib.ak_q35_set_splitk.restype = ctypes.c_int
     lib.ak_q35_cache_save.argtypes = [vp, ctypes.c_int]
@@ -331,6 +333,10 @@ class Qwen35Model:
         """Most K splits per int8 prefill GEMM on short chunks (default 4; 1 = off, so every token's activations are
         independent of the chunk length)."""
         self.native.check(self.native.lib.ak_q35_set_splitk(self.handle, int(max_split)))
+
+    def set_glu(self, on: bool) -> None:
+        """True (default): prefill FFN gate + up + SiLU in one fused GEMM; False: two GEMMs + SiLU (bit-identical)."""
+        self.native.check(self.native.lib.ak_q35_set_glu(self.handle, int(on)))
 
     def cache_state(self, slot: int) -> np.ndarray:
         """A copy of the recurrent state saved in a prefix-cache slot (tests / debugging)."""

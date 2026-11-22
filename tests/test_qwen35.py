@@ -135,6 +135,22 @@ def test_prefix_cache_equals_fresh(model):
         model.generate_cached(ids, 1, snap_at=fmt.snap_points(ids))
 
 
+def test_fused_glu_matches_unfused(model):
+    """The fused gate + up + SiLU GEMM gives bit-identical logits to two GEMMs + k_silu_quant (64- and 128-token
+    tile paths)."""
+    import numpy as np
+
+    ids = tokenize(MODEL, _long_prompt())
+    try:
+        fused = [model.logits(ids[:100]), model.logits(ids)]
+        model.set_glu(False)
+        plain = [model.logits(ids[:100]), model.logits(ids)]
+    finally:
+        model.set_glu(True)
+    for a, b in zip(fused, plain):
+        assert np.array_equal(a, b)
+
+
 def test_snapshot_inside_chunk(model):
     """A snapshot requested in the middle of a batched prefill chunk is taken inside the conv / delta-rule kernels
     (SnapReq); restoring it for a different continuation must give exactly the fresh greedy tokens."""
