@@ -200,7 +200,7 @@ def test_attention_v2_matches_v1(model, batched):
         new = model.logits(ids)
         new_tok = model.generate_spec(ids, 32)["tokens"]
     finally:
-        model.set_attention(1)
+        model.set_attention(2)
         model.set_prefill(True)
     assert np.array_equal(ref, new)
     assert np.array_equal(ref_tok, new_tok)

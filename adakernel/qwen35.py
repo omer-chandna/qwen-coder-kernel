@@ -345,9 +345,9 @@ class Qwen35Model:
         self.native.check(self.native.lib.ak_q35_set_prefill(self.handle, int(batched)))
 
     def set_attention(self, tensor_core: bool | int) -> None:
-        """True / 1 (default): tensor-core tiled attention; 2: its v2 (ldmatrix + cp.async, opt-in until benchmarked);
+        """True / 2 (default): tensor-core tiled attention v2 (ldmatrix + cp.async); 1: the first tensor-core kernel;
         False / 0: the older per-column scalar kernels."""
-        mode = int(tensor_core)
+        mode = 2 if tensor_core is True else int(tensor_core)
         self.native.check(self.native.lib.ak_q35_set_attn(self.handle, mode))
 
     def set_qgemm(self, max_cols: int) -> None:

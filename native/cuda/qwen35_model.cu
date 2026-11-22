@@ -292,9 +292,8 @@ struct ak_q35_model {
     Bufs pf;                             // prefill, pf_cols columns, allocated on the first long prompt
     int pf_cols = kPfCols;
     bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
-    int attn = 1;                        // attention kernels: 0 per-column scalar, 1 k_attn_mma, 2 k_attn_mma2
-                                         // (AK_Q35_ATTN; AK_Q35_ATTN_OLD=1 is 0). v2 becomes the default once
-                                         // benchmarks/attn_bench.cu has confirmed it on the GPU.
+    int attn = 2;                        // attention kernels: 0 per-column scalar, 1 k_attn_mma, 2 k_attn_mma2
+                                         // (AK_Q35_ATTN; AK_Q35_ATTN_OLD=1 is 0)
     int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
                                          // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
     bool int8_gemm = true;               // prefill GEMMs on int8 tensor cores with Q8_1 activations, the decode path's
@@ -1115,7 +1114,7 @@ __global__ void __launch_bounds__(128) k_attn_mma(const float* q, const __half* 
 }
 
 // ------------------------------------------------------------------------------------------------
-// Tensor-core attention, v2 (`k_attn_mma2`, opt-in: AK_Q35_ATTN=2 / set_attention(2)). Same tiling, masking and outputs as k_attn_mma; two changes
+// Tensor-core attention, v2 (`k_attn_mma2`, the default). Same tiling, masking and outputs as k_attn_mma; two changes
 // in how data reaches the tensor cores (docs/QWEN38_9B.md, "Attention v2"):
 //   1. Every mma operand comes from one ldmatrix instead of 32-bit / 16-bit shared loads. v1 issued 12 LDS.32 per
 //      four S mmas and 4 LDS.16 + 2 packs per PV mma, so the PV half was load-issue bound; ldmatrix.x4 gives the
@@ -2756,7 +2755,7 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
         ak_set_error("qwen35 set_attn: null model");
         return AK_ERR_INVALID;
     }
-    const int mode = tensor_core < 0 || tensor_core > 2 ? 1 : tensor_core;
+    const int mode = tensor_core < 0 || tensor_core > 2 ? 2 : tensor_core;
     if (m->attn == mode) return AK_OK;
     ak_status st = ck(cudaStreamSynchronize(m->stream));
     for (auto& kv : m->graphs) cudaGraphExecDestroy(kv.second);  // captured graphs bake in the kernel choice

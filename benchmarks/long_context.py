@@ -1,6 +1,8 @@
-"""Long-context prompt reading and decode speed: tensor-core attention vs the older scalar kernels.
+"""Long-context prompt reading and decode speed for two attention kernels (default: tensor-core v1 vs v2).
 
-    python -m benchmarks.long_context [--ctx 40960] [--pf-cols 512] [--sizes 4000,12000,24000,36000]
+    python -m benchmarks.long_context [--ctx 40960] [--pf-cols 512] [--sizes 4000,12000,24000,36000] [--kernels 1,2]
+
+Kernels: 0 = per-column scalar, 1 = k_attn_mma, 2 = k_attn_mma2.
 
 Each size is a fresh (uncached) chat prompt built from this repo's sources, then 128 tokens of speculative decoding.
 """
@@ -22,6 +24,7 @@ def main() -> None:
     ap.add_argument("--sizes", default="4000,12000,24000,36000")
     ap.add_argument("--n-gen", type=int, default=128)
     ap.add_argument("--output", default=None)
+    ap.add_argument("--kernels", default="1,2", help="two attention kernels to compare (0 scalar, 1 v1, 2 v2)")
     args = ap.parse_args()
     os.environ["AK_Q35_PF_COLS"] = str(args.pf_cols)
 
@@ -34,6 +37,7 @@ def main() -> None:
                       "adakernel/qwen_tokenizer.py", "native/cuda/ops.cuh"])
     corpus_ids = fmt.tok.encode(corpus)
     m = Qwen35Model(DEFAULT_MODEL, max_seq=args.ctx)
+    ka, kb = (int(x) for x in args.kernels.split(","))
     rows = []
     for n in (int(x) for x in args.sizes.split(",")):
         body = fmt.tok.decode(corpus_ids[:n])
@@ -43,7 +47,7 @@ def main() -> None:
         if len(ids) + args.n_gen + 16 > args.ctx:
             break
         row = {"prompt_tokens": len(ids)}
-        for name, tc in (("old", False), ("new", True)):
+        for name, tc in (("old", ka), ("new", kb)):
             m.set_attention(tc)
             m.generate_spec(ids[:64], 8)  # warm graphs for this kernel choice
             r = m.generate_spec(ids, args.n_gen)
@@ -57,7 +61,7 @@ def main() -> None:
               f"| same first 32: {row['same_first_32']}", flush=True)
     m.close()
     if args.output:
-        Path(args.output).write_text(json.dumps({"ctx": args.ctx, "pf_cols": args.pf_cols, "rows": rows}, indent=1))
+        Path(args.output).write_text(json.dumps({"ctx": args.ctx, "pf_cols": args.pf_cols, "kernels": [ka, kb], "rows": rows}, indent=1))
 
 
 if __name__ == "__main__":
