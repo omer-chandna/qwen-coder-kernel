@@ -189,7 +189,7 @@ to a llama.cpp `build/bin` folder to also check token and greedy-output parity w
 | `python -m benchmarks.long_context` | prompt reading and decode at 4k-36k context |
 | `python -m benchmarks.llama_match` | how long greedy output agrees with `llama-completion --temp 0` |
 | `scripts\cuda_bench.ps1 -Bench attn` / `-Bench gemm` | attention or int8 GEMM kernels alone on random data (no model load): bit equality and timing |
-| `scriptsb_profile.ps1 -A <checkout> -B <checkout>` | interleaved A/B of `chunk_profile` between two builds |
+| `scripts\ab_profile.ps1 -A <checkout> -B <checkout>` | interleaved A/B of `chunk_profile` between two builds |
 | `python -m benchmarks.sass_hotspots <sass.csv>` | summarizes an Nsight Compute SASS export (stalls by opcode, bank conflicts) |
 
 The model benchmarks load the model on the GPU (~6 GB), so stop the server first or wait for it to be idle.
