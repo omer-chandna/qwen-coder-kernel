@@ -102,32 +102,53 @@ __device__ __forceinline__ Q4kLane q4k_lane(const uint8_t* blk, int t) {
     return L;
 }
 
+// What a lane reads from one activation column for one super-block: its 2 x 16 int8 values, their sums (for the
+// min term) and the two sub-block scales. It depends only on the lane's position, not on the weight row, so a lane
+// that computes several rows loads it once (qgemv_dp4a_rows_mc2).
+struct Q4kX {
+    int4 xa, xb;
+    int sl, sh;
+    float x0, x1;
+};
+
 // xq, xd point at this super-block's activations (256 int8, 8 scales).
-__device__ __forceinline__ float q4k_col(const Q4kLane& L, const int8_t* xq, const float* xd) {
-    const int4 xa = *reinterpret_cast<const int4*>(xq + L.xoff);
-    const int4 xb = *reinterpret_cast<const int4*>(xq + L.xoff + 32);
+__device__ __forceinline__ Q4kX q4k_x(const Q4kLane& L, const int8_t* xq, const float* xd) {
+    Q4kX X;
+    X.xa = *reinterpret_cast<const int4*>(xq + L.xoff);
+    X.xb = *reinterpret_cast<const int4*>(xq + L.xoff + 32);
     const int ones = 0x01010101;
-    int dl = 0, dh = 0, sl = 0, sh = 0;
-    dl = __dp4a(L.w.x & 0x0F0F0F0F, xa.x, dl);
-    dl = __dp4a(L.w.y & 0x0F0F0F0F, xa.y, dl);
-    dl = __dp4a(L.w.z & 0x0F0F0F0F, xa.z, dl);
-    dl = __dp4a(L.w.w & 0x0F0F0F0F, xa.w, dl);
-    dh = __dp4a((L.w.x >> 4) & 0x0F0F0F0F, xb.x, dh);
-    dh = __dp4a((L.w.y >> 4) & 0x0F0F0F0F, xb.y, dh);
-    dh = __dp4a((L.w.z >> 4) & 0x0F0F0F0F, xb.z, dh);
-    dh = __dp4a((L.w.w >> 4) & 0x0F0F0F0F, xb.w, dh);
-    sl = __dp4a(ones, xa.x, sl);
-    sl = __dp4a(ones, xa.y, sl);
-    sl = __dp4a(ones, xa.z, sl);
-    sl = __dp4a(ones, xa.w, sl);
-    sh = __dp4a(ones, xb.x, sh);
-    sh = __dp4a(ones, xb.y, sh);
-    sh = __dp4a(ones, xb.z, sh);
-    sh = __dp4a(ones, xb.w, sh);
-    const float x0 = xd[L.is];
-    const float x1 = xd[L.is + 1];
-    return L.dm.x * (x0 * static_cast<float>(L.sc0 * dl) + x1 * static_cast<float>(L.sc1 * dh)) -
-           L.dm.y * (x0 * static_cast<float>(L.m0 * sl) + x1 * static_cast<float>(L.m1 * sh));
+    int sl = 0, sh = 0;
+    sl = __dp4a(ones, X.xa.x, sl);
+    sl = __dp4a(ones, X.xa.y, sl);
+    sl = __dp4a(ones, X.xa.z, sl);
+    sl = __dp4a(ones, X.xa.w, sl);
+    sh = __dp4a(ones, X.xb.x, sh);
+    sh = __dp4a(ones, X.xb.y, sh);
+    sh = __dp4a(ones, X.xb.z, sh);
+    sh = __dp4a(ones, X.xb.w, sh);
+    X.sl = sl;
+    X.sh = sh;
+    X.x0 = xd[L.is];
+    X.x1 = xd[L.is + 1];
+    return X;
+}
+
+__device__ __forceinline__ float q4k_dot(const Q4kLane& L, const Q4kX& X) {
+    int dl = 0, dh = 0;
+    dl = __dp4a(L.w.x & 0x0F0F0F0F, X.xa.x, dl);
+    dl = __dp4a(L.w.y & 0x0F0F0F0F, X.xa.y, dl);
+    dl = __dp4a(L.w.z & 0x0F0F0F0F, X.xa.z, dl);
+    dl = __dp4a(L.w.w & 0x0F0F0F0F, X.xa.w, dl);
+    dh = __dp4a((L.w.x >> 4) & 0x0F0F0F0F, X.xb.x, dh);
+    dh = __dp4a((L.w.y >> 4) & 0x0F0F0F0F, X.xb.y, dh);
+    dh = __dp4a((L.w.z >> 4) & 0x0F0F0F0F, X.xb.z, dh);
+    dh = __dp4a((L.w.w >> 4) & 0x0F0F0F0F, X.xb.w, dh);
+    return L.dm.x * (X.x0 * static_cast<float>(L.sc0 * dl) + X.x1 * static_cast<float>(L.sc1 * dh)) -
+           L.dm.y * (X.x0 * static_cast<float>(L.m0 * X.sl) + X.x1 * static_cast<float>(L.m1 * X.sh));
+}
+
+__device__ __forceinline__ float q4k_col(const Q4kLane& L, const int8_t* xq, const float* xd) {
+    return q4k_dot(L, q4k_x(L, xq, xd));
 }
 
 __device__ __forceinline__ float q4k_dp4a_sb(const uint8_t* blk, const int8_t* xq, const float* xd, int t) {
@@ -183,27 +204,49 @@ __device__ __forceinline__ Q6kLane q6k_lane(const uint8_t* blk, int t) {
     return L;
 }
 
-__device__ __forceinline__ float q6k_col(const Q6kLane& L, const int8_t* xq, const float* xd) {
+// As Q4kX: one lane's activations of one column for one super-block, row-independent.
+struct Q6kX {
+    int xv[2][4];
+    int sum[4];
+    float xd[4];
+};
+
+__device__ __forceinline__ Q6kX q6k_x(const Q6kLane& L, const int8_t* xq, const float* xd) {
+    Q6kX X;
     const int8_t* xb = xq + L.xoff;
-    const float* xdb = xd + L.doff;
     const int ones = 0x01010101;
-    int dot[4] = {0, 0, 0, 0};
-    int sum[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int k = 0; k < 4; ++k) X.sum[k] = 0;
 #pragma unroll
     for (int w = 0; w < 2; ++w) {
 #pragma unroll
         for (int k = 0; k < 4; ++k) {
-            const int xv = *reinterpret_cast<const int*>(xb + k * 32 + 4 * w);
-            dot[k] = __dp4a(L.q[w][k], xv, dot[k]);
-            sum[k] = __dp4a(ones, xv, sum[k]);
+            X.xv[w][k] = *reinterpret_cast<const int*>(xb + k * 32 + 4 * w);
+            X.sum[k] = __dp4a(ones, X.xv[w][k], X.sum[k]);
         }
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) X.xd[k] = xd[L.doff + k];
+    return X;
+}
+
+__device__ __forceinline__ float q6k_dot(const Q6kLane& L, const Q6kX& X) {
+    int dot[4] = {0, 0, 0, 0};
+#pragma unroll
+    for (int w = 0; w < 2; ++w) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) dot[k] = __dp4a(L.q[w][k], X.xv[w][k], dot[k]);
     }
     float acc = 0.f;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        acc += xdb[k] * L.sc[k] * static_cast<float>(dot[k] - 32 * sum[k]);
+        acc += X.xd[k] * L.sc[k] * static_cast<float>(dot[k] - 32 * X.sum[k]);
     }
     return L.d * acc;
+}
+
+__device__ __forceinline__ float q6k_col(const Q6kLane& L, const int8_t* xq, const float* xd) {
+    return q6k_dot(L, q6k_x(L, xq, xd));
 }
 
 __device__ __forceinline__ float q6k_dp4a_sb(const uint8_t* blk, const int8_t* xq, const float* xd, int t) {
@@ -351,6 +394,86 @@ __device__ __forceinline__ void qgemv_dp4a_rows_mc(const uint8_t* W, const int8_
 #pragma unroll
                 for (int o = LPR / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
                 if (valid && sub == 0) y[c * ystride + row] = v;
+            }
+        }
+    }
+    __syncthreads();
+}
+
+// Multi-column passes: as qgemv_dp4a_rows_mc for the K-quants, but each half-warp computes R rows (base + 2 i + half)
+// at the same K positions. Activations (and their sums) are loaded once per column
+// for both rows, which halves activation traffic per weight; a no-activation-loads experiment had shown loads were
+// the largest per-column cost. Each row's arithmetic, accumulation order and 16-lane reduction are those of
+// qgemv_dp4a_rows_mc, so results are bit-identical. Rows per warp: 2 R.
+// Rows [row0, row_end) of [W; W2] (rows >= rows1 come from W2, chosen per row, so a block may straddle the two).
+template <int type, int NC, int R>
+__device__ __forceinline__ void qgemv_dp4a_rows_mc2(const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq,
+                                                    const float* xd, float* y, int ystride, int row0, int row_end,
+                                                    int K) {
+    static_assert(type == 1 || type == 2, "K-quants only");
+    constexpr int LPR = 16;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = blockDim.x >> 5;
+    const int nb = K >> 8;
+    const int bb = type == 1 ? 144 : 210;
+    const size_t row_bytes = static_cast<size_t>(nb) * bb;
+    const int kd = K >> 5;
+    const int half = lane / LPR;
+    const int sub = lane % LPR;
+    const int t = sub & 7;
+    auto row_ptr = [&](int r) {
+        return W2 && r >= rows1 ? W2 + static_cast<size_t>(r - rows1) * row_bytes : W + static_cast<size_t>(r) * row_bytes;
+    };
+    for (int base = row0 + warp * 2 * R; base < row_end; base += nwarps * 2 * R) {
+        int rr[R];
+        bool vv[R];
+        const uint8_t* pr[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            rr[i] = base + 2 * i + half;
+            vv[i] = rr[i] < row_end;
+            pr[i] = row_ptr(vv[i] ? rr[i] : base);
+        }
+        float acc[R][NC];
+#pragma unroll
+        for (int i = 0; i < R; ++i)
+#pragma unroll
+            for (int c = 0; c < NC; ++c) acc[i][c] = 0.f;
+        if (vv[0]) {
+#pragma unroll 1
+            for (int b = sub >> 3; b < nb; b += LPR / 8) {
+                if (type == 1) {
+                    Q4kLane L[R];
+#pragma unroll
+                    for (int i = 0; i < R; ++i) L[i] = q4k_lane(pr[i] + b * 144, t);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        const Q4kX X = q4k_x(L[0], xq + c * K + b * 256, xd + c * kd + b * 8);
+#pragma unroll
+                        for (int i = 0; i < R; ++i) acc[i][c] += q4k_dot(L[i], X);
+                    }
+                } else {
+                    Q6kLane L[R];
+#pragma unroll
+                    for (int i = 0; i < R; ++i) L[i] = q6k_lane(pr[i] + b * 210, t);
+#pragma unroll
+                    for (int c = 0; c < NC; ++c) {
+                        const Q6kX X = q6k_x(L[0], xq + c * K + b * 256, xd + c * kd + b * 8);
+#pragma unroll
+                        for (int i = 0; i < R; ++i) acc[i][c] += q6k_dot(L[i], X);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                float a = acc[i][c];
+#pragma unroll
+                for (int o = LPR / 2; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffff, a, o);
+                if (sub == 0 && vv[i]) y[c * ystride + rr[i]] = a;
             }
         }
     }

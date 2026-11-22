@@ -671,7 +671,8 @@ __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_gr
 
 // DIAG (benchmarks/gemm_bench.cu only; the runtime uses 0), all timing only with wrong results:
 //   1 = the per-sub-block float epilogue reduced to one add per output, 2 = no min term,
-//   4 = no mma either (loads, syncs and fragment reads only), 5 = no global -> shared copies (compute only).
+//   4 = no mma either (loads, syncs and fragment reads only), 5 = no global -> shared copies (compute only),
+//   6 = no per-stage scale decode and no barrier after it.
 template <int BN, int S, int MB = 1, int DIAG = 0>
 __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t* xq, const float* xd,
                                                const float* xsd, float* Y, int rows, int K, int T, int ldy,
@@ -746,7 +747,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
         __syncthreads();  // stage kt landed for every thread; stage kt - 1 and wsc are free
         const int st = kt % S;
         const int h = ((kt * P4_BK) >> 7) & 1;
-        {  // sub-block scales of this stage: BM rows x 4 sub-blocks (global sub-block 4h + sb)
+        if constexpr (DIAG != 6) {  // sub-block scales of this stage: BM rows x 4 sub-blocks (global sub-block 4h + sb)
             const uint8_t* ws = wraw(st);
             for (int i = tid; i < BM * 4; i += NT) {
                 const int r = i >> 2, sb = i & 3;
@@ -766,7 +767,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
                 wsc[r * 8 + (sb >> 1) * 4 + 2 + (sb & 1)] = dm.y * static_cast<float>(mn);
             }
         }
-        __syncthreads();
+        if constexpr (DIAG != 6) __syncthreads();
         if (kt + S - 1 < kt0 + nk) issue(kt + S - 1);
         cp_async_commit();
 

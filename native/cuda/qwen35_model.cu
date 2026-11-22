@@ -435,7 +435,20 @@ __global__ void __launch_bounds__(1024) k_mtp_in(float* e, float* h, const float
     }
 }
 
-// Multi-column dp4a GEMV, 128 threads per block. Optional second matrix W2: rows >= rows1 come from it.
+// Rows one warp of k_gemv_mc covers: K-quant verify passes of 5-12 columns use 4 (two per half-warp, sharing
+// activation loads), everything else qgemv_rows_per_warp's 2 (K-quants) or 1 (Q8_0).
+// Rows per half-warp in k_gemv_mc (qgemv_dp4a_rows_mc2 shares one activation load across them; 0 = the one-row
+// kernel). Measured per width (ms per target pass, docs/QWEN38_9B.md "Wide verify"): <= 4 columns are bandwidth-bound
+// and gain nothing; 2 rows win at 5-10 columns; 3 rows at 11-12 (12: 33.5 -> 30.4 ms) but lose at 10 (27.2 -> 29.0).
+__host__ __device__ constexpr int mc_r(int type, int NC) {
+    return type == 0 || NC <= 4 ? 0 : (NC <= 10 ? 2 : 3);
+}
+__host__ __device__ constexpr int mc_rows_per_warp(int type, int NC) {
+    return mc_r(type, NC) > 0 ? 2 * mc_r(type, NC) : akd::qgemv_rows_per_warp(type);
+}
+
+// Multi-column dp4a GEMV, 128 threads per block. Optional second matrix W2: rows >= rows1 come from it (the
+// one-row kernel needs rows1 to be a multiple of its rows per block; mm2 checks that).
 // Up to 4 columns a pass is bandwidth-bound and 8 blocks / SM (64 registers) hide DRAM latency; wider variants
 // (verify passes of 5-12 tokens) carry one accumulator per column and ran out of registers at 64, so they get
 // 4 blocks / SM (128 registers): 12 columns 50.3 -> 44.9 ms per target pass. 2 blocks (255) was worse.
@@ -444,7 +457,7 @@ __global__ void __launch_bounds__(128, (NC > 4 ? 4 : 8)) k_gemv_mc(const uint8_t
                                                     const float* xd, float* y, int ystride, int rows, int K) {
     constexpr int bb = type == 0 ? 34 : (type == 1 ? 144 : 210);
     const int nb = type == 0 ? (K >> 5) : (K >> 8);
-    const int per_block = (blockDim.x >> 5) * akd::qgemv_rows_per_warp(type);
+    const int per_block = (blockDim.x >> 5) * mc_rows_per_warp(type, NC);
     const int row0 = blockIdx.x * per_block;
     if (row0 >= rows) return;
     const int nrows = min(per_block, rows - row0);
@@ -454,8 +467,13 @@ __global__ void __launch_bounds__(128, (NC > 4 ? 4 : 8)) k_gemv_mc(const uint8_t
         base = W2;
         wrow = row0 - rows1;
     }
-    akd::qgemv_dp4a_rows_mc<type, NC>(base + static_cast<size_t>(wrow) * nb * bb, xq, xd, y + row0, ystride, nrows,
-                                      K);
+    if constexpr (mc_r(type, NC) > 0) {
+        akd::qgemv_dp4a_rows_mc2<type, NC, mc_r(type, NC)>(W, W2, W2 ? rows1 : rows, xq, xd, y, ystride, row0,
+                                                           row0 + nrows, K);
+    } else {
+        akd::qgemv_dp4a_rows_mc<type, NC>(base + static_cast<size_t>(wrow) * nb * bb, xq, xd, y + row0, ystride,
+                                          nrows, K);
+    }
 }
 
 // Causal depthwise conv over the last 4 inputs of every channel, then SiLU, for T consecutive tokens.
@@ -1485,7 +1503,7 @@ void mark(Prof* p, cudaStream_t s, int kind) {
 template <int type>
 void launch_mc(int T, const uint8_t* W, const uint8_t* W2, int rows1, const int8_t* xq, const float* xd, float* y,
                int ystride, int rows, int K, cudaStream_t s) {
-    const int per_block = 4 * akd::qgemv_rows_per_warp(type);
+    const int per_block = 4 * mc_rows_per_warp(type, std::min(T, kMaxCols));
     const int blocks = (rows + per_block - 1) / per_block;
 #define AK_Q35_MC(N) \
     case N: k_gemv_mc<type, N><<<blocks, 128, 0, s>>>(W, W2, rows1, xq, xd, y, ystride, rows, K); break;
@@ -1696,7 +1714,8 @@ ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a
 
 // Two matrices with the same type and K go out as one GEMV launch writing [A rows | B rows].
 ak_status mm2(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat& B, Act a, float* y, int ystride, int T) {
-    if (b.pf || (A.type == B.type && A.K == B.K && (A.rows % 8) == 0)) return mm(m, b, A, &B, a, y, ystride, T);
+    // one launch for both: a block must not straddle A and B (16 rows per block in wide verify passes)
+    if (b.pf || (A.type == B.type && A.K == B.K && (A.rows % 16) == 0)) return mm(m, b, A, &B, a, y, ystride, T);
     ak_status st = mm(m, b, A, nullptr, a, y, ystride, T);
     if (st == AK_OK) st = mm(m, b, B, nullptr, a, y + A.rows, ystride, T);
     return st;

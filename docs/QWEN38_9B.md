@@ -636,6 +636,53 @@ A 512-token chunk at position 0 now takes 273 ms: matrix products 232 (85%), del
 int8 GEMMs are again the main cost of prompt reading, and at long context attention joins them.
 Raw: `experiments/results/ab_gdn/`.
 
+## Wide verify: one activation load for 2-3 weight rows
+
+Code-editing output (an agent rewriting a function with small changes) runs on prompt-lookup drafts of up to 11
+tokens, so its rounds verify 10-12 columns. Those passes were still 1.5-2x the 22 ms weight-read floor.
+
+First, where a wide pass's time goes. Timing-only experiments inside `q4k_col` (Q4_K weights only, 12 columns):
+- no activation loads (constants): 43.6 -> 35.4 ms;
+- trivial float epilogue: 43.6 -> 37.3 ms;
+- earlier, no activation-sum dp4a: -8%, and exact int -> float instead of I2F: no change.
+
+So the activation loads were the largest single cost. In `qgemv_dp4a_rows_mc` the two half-warps work on different
+rows, and every lane reloads its 32 activation bytes, their two scales, and recomputes their sums for every row,
+once per column.
+
+`qgemv_dp4a_rows_mc2<type, NC, R>`: each half-warp computes R rows at the same K positions:
+- `q4k_col` / `q6k_col` split into a row-independent part (`q4k_x` / `q6k_x`: load the lane's activations, their
+  sums and scales) and a per-row part (`q4k_dot` / `q6k_dot`). One load then serves R rows.
+- Each row's integer dot products, float formula, accumulation order over super-blocks and 16-lane reduction tree are
+  exactly those of the one-row kernel, so results are bit-identical. The GEMV-path logits hash and every generated
+  token are unchanged.
+- The matrix (A or B of a combined two-matrix launch) is chosen per row, so blocks of 2 R x 4 rows may straddle
+  the boundary. The one-row kernel needs it to fall on a block boundary, and 8192 rows is not a multiple of 24.
+
+R per width, measured (ms per target pass):
+
+| columns | 4 | 5 | 6 | 8 | 9 | 10 | 11 | 12 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| one row per lane | 23.1 | 24.1 | 27.0 | 32.0 | 35.9 | 38.4 | 42.1 | 44.9 |
+| R = 2 | 23.7 | 23.1 | 24.0 | **24.6-25.3** | **26.3** | **27.2** | 29.6 | 33.5 |
+| R = 3 | | | | | 26.4 | 29.0 | **29.0** | **30.4** |
+
+Chosen: R = 2 for 5-10 columns, 3 for 11-12. Up to 4 columns the pass is bandwidth-bound, R = 2 gains nothing there
+and one variant spilled, so those keep the one-row kernel at 64 registers. A 12-column verify now costs 1.37x a
+1-column one (was 2.03x).
+
+Decode, `benchmarks/decode_bench.py`, interleaved against `main` at 9f70a0b, 3 reps x 2 rounds, tokens identical:
+
+| prompt | before | after |
+|---|---:|---:|
+| write tests | 95.6 tok/s | **99.6** |
+| refactor (copies most of a function) | 253 | **353.5** |
+| explain | 95.1 | **103.8** |
+
+The draft policy picks draft lengths from measured verify costs, so cheaper wide passes also lengthen MTP drafts.
+Mean draft on "explain" went 3.8 -> 4.6, and tokens per round 2.80 -> 3.11.
+Raw: `experiments/results/decode_mc2_{base,new}_{0,1}.json`.
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around
@@ -643,7 +690,10 @@ Raw: `experiments/results/ab_gdn/`.
   or per thread in registers, would remove one barrier per stage.
 - **Gated DeltaNet recurrence**: now 16 ms of a 512-token chunk (6%). A chunked (WY / UT-transform) formulation could
   put it on tensor cores, but at most ~5% of a chunk is left to win.
-- **Verify passes past 4 columns** still add ~3-4 ms per column (44.9 ms at 12). Speculative decoding on code now
-  often runs 10-12-column passes, so a cheaper wide verify converts directly into tok/s. It must stay bit-identical to
-  the T = 1 decode path, which rules out tensor cores unless decode moves to the same arithmetic.
+- **Wide verify** is now 30.4 ms at 12 columns against a 22 ms floor. The rest is the float epilogue and dp4a work
+  per column. It must stay bit-identical to the T = 1 decode path, which rules out tensor cores unless decode moves
+  to the same arithmetic.
+- **MTP-drafted decode** (prose, tests) is ~85% target pass, and its 4-5-column passes are within ~10% of the
+  weight-bandwidth floor (22.2 ms for 4.9 GB, ~221 GB/s against a ~246 GB/s copy peak). MTP draft steps cost ~1.3 ms
+  each. Further gains there need more accepted tokens per round (draft quality), not faster kernels.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

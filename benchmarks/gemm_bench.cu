@@ -246,7 +246,9 @@ int main() {
             if (M.type == 1) {
                 t3 = time_ms([&] { launch<4>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
                 const float t5 = time_ms([&] { launch<5>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
-                std::printf("   no mma (DIAG 4): %.3f ms | no copies (DIAG 5): %.3f ms\n", t3, t5);
+                const float t6 = time_ms([&] { launch<6>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
+                std::printf("   no mma (DIAG 4): %.3f ms | no copies (DIAG 5): %.3f ms | no scale decode (DIAG 6): %.3f ms\n",
+                            t3, t5, t6);
             }
             std::printf("%-14s %5d | %8.3f %7.1f | %9.2e | %8.3f %7.1f | %8.3f %7.1f\n", M.name, T, t0,
                         macs / t0 * 1e-9, worst, t1, macs / t1 * 1e-9, t2, t2 > 0 ? macs / t2 * 1e-9 : 0.0);
