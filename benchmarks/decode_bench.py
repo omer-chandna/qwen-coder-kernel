@@ -25,11 +25,18 @@ def prompts(fmt, src: str) -> dict[str, list[int]]:
         "write tests": ("Write pytest unit tests for the prefill function below.", src[52000:58000]),
         "refactor": ("Refactor this function to be shorter without changing behavior.", src[30000:33000]),
         "explain": ("Explain what this code does, step by step.", src[42000:46000]),
+        "add comments": ("Add a short comment above each block of this code and return the whole code.",
+                         src[46000:48500]),
+        "implement": ("Write a C++ function `int lookup(const std::vector<int>& h, int n_min, int n_max)` that returns "
+                      "the index after the most recent earlier occurrence of the longest suffix of h with length in "
+                      "[n_min, n_max], or -1. Then write three unit tests for it.", ""),
+        "to python": ("Translate this code to idiomatic Python with type hints.", src[36000:38500]),
     }
     out = {}
     for name, (ask, code) in tasks.items():
+        body = ask + ("\n\n```cpp\n" + code + "\n```" if code else "")
         msgs = [{"role": "system", "content": "You are a helpful coding assistant."},
-                {"role": "user", "content": ask + "\n\n```cpp\n" + code + "\n```"}]
+                {"role": "user", "content": body}]
         out[name] = fmt.tok.encode(fmt.render(msgs, None))
     return out
 

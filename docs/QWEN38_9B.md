@@ -683,6 +683,52 @@ The draft policy picks draft lengths from measured verify costs, so cheaper wide
 Mean draft on "explain" went 3.8 -> 4.6, and tokens per round 2.80 -> 3.11.
 Raw: `experiments/results/decode_mc2_{base,new}_{0,1}.json`.
 
+## Draft policy v2: acceptance by match length, optimized lookup length, an agreement gate
+
+With wide verify cheap, how well each round is drafted matters more. `benchmarks/decode_bench.py` now has six
+coding tasks:
+- the original three: write tests, refactor, explain;
+- add comments: returns the input code with comments added, so it is copy-heavy;
+- implement: from a description, no code in the prompt;
+- to python: translates C++, so its n-gram matches are unreliable.
+
+**What the data said.** An offline replay of the generated outputs (for every position: does an n-gram lookup
+exist, and how many following tokens does it predict) showed:
+- On "explain", 82 of 256 positions had a >= 3-gram match predicting 4.35 tokens on average, more than an MTP round's
+  3.1. Yet the policy used lookup in only 3 rounds.
+- Acceptance per drafted position depends strongly on the match length n: 0.36-0.56 at n = 2, 0.43-0.69 at n = 3,
+  ~0.9 at n >= 4, and 0.99 for code copied from the prompt.
+- The policy had one acceptance estimate for all matches, and a proposal cap (`ng_len`) that collapsed to got + 1
+  after any miss. So a failed short match vetoed the long, reliable ones.
+
+**Changes** (`Policy`, `spec_run`):
+1. **Three acceptance estimates**, for n = 2, 3 and >= 4, with priors 0.4 / 0.6 / 0.9 from that measurement. Each
+   is updated by its own rounds and pulled back toward its prior when skipped.
+2. **Lookup draft length optimized like the MTP one:** the L maximizing expected tokens per ms, using the measured
+   verify cost at each width. This replaces the `ng_len` heuristic.
+3. **Agreement gate.** A lookup candidate's round first runs the MTP pass with its head (which it needs anyway to
+   fill the MTP KV cache; the head adds ~1 ms), reads the MTP draft d1 back (one small sync), and uses the lookup
+   only if its first token equals d1. Otherwise the round becomes the MTP round the policy would have run. A failed
+   lookup round yields one token for a full verify. In a translation, matches are often wrong from the first token.
+4. **Gate skipped for reliable matches** (learned acceptance >= 0.9, i.e. copying). There the head and the sync are
+   pure overhead: -2-4% measured without the skip.
+
+Decode tok/s, interleaved runs against `main` at afc866c (2 x 2 reps; tokens identical to `main` in every run):
+
+| task | main | 1 + 2 | + 3 (gate) | + 4 (skip), final |
+|---|---:|---:|---:|---:|
+| write tests | 99.5 | 100.0 | 100.8 | 99.8 |
+| refactor | 351 | 351.5 | 343.5 | 352.4 |
+| explain | 103 | 107 | 109.7 | **108.9** |
+| add comments | 163.6 | 205.5 | 196.7 | **205.7** |
+| implement | 113.5 | 113 | 115.5 | **115.7** |
+| to python | 113.6 | 108.4 | 111.2 | 111.1 |
+| geometric mean | 140.2 | 145.5 | 145.8 | **147.1 (+4.9%)** |
+
+"to python" is still 2% slower than `main`. The remaining loss is from lookups that pass the gate but fail at the
+second token. Tuning further against six prompts would be overfitting, so it is left as is.
+Raw: `experiments/results/decode_pol_base_{0,1}.json` (main) and `decode_gate2_{0,1}.json` (final).
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around

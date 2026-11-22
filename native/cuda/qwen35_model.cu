@@ -2621,18 +2621,25 @@ extern "C" ak_status ak_q35_generate(ak_q35_model* m, const int32_t* prompt, int
 
 namespace {
 
-constexpr float kLaPrior = 0.9f;
+// Prompt-lookup acceptance per drafted position, by the length n of the n-gram that matched: n = 2, 3, >= 4.
+// Measured offline on the coding prompts of benchmarks/decode_bench.py (positions where a lookup exists, how many of
+// the following tokens it predicts): 0.36-0.56 at n = 2, 0.43-0.69 at n = 3, ~0.9 at n >= 4 (0.99 on code copied
+// from the prompt). One estimate for all lengths let a failed short match veto the long, reliable ones.
+constexpr int kLaBuckets = 3;
+constexpr float kLaPrior[kLaBuckets] = {0.4f, 0.6f, 0.9f};
 constexpr float kLaPull = 0.02f;
+constexpr float kGateSkip = 0.9f;  // lookup acceptance above which the agreement gate is skipped
+int la_bucket(int n) { return n <= 2 ? 0 : (n == 3 ? 1 : 2); }
 
 // Speculation cost model and acceptance estimates, updated every round from GPU event timings.
 struct Policy {
     float acc[kMaxCols];                // P(MTP draft i accepted | draft i - 1 accepted), i >= 1
-    // Prompt-lookup acceptance per position. Only lookup rounds update it, so a pessimistic start meant lookup was
-    // never tried once MTP acceptance was high, and whether it ever got going (1.6x on code-copying output) came
-    // down to timing noise in the first rounds. Start optimistic (an n-gram match in code usually continues), and
-    // pull it back toward that prior in rounds where a match exists but MTP was chosen (kLaPrior / kLaPull).
-    float la = kLaPrior;
-    int ng_len = 4;                     // current lookup proposal cap
+    // Prompt-lookup acceptance per position, per match-length bucket. Only lookup rounds update a bucket, so it starts
+    // at a measured prior (a pessimistic start meant lookup was never tried once MTP acceptance was high) and is
+    // pulled back toward it in rounds where its kind of match exists but MTP was chosen (kLaPrior / kLaPull).
+    // The draft length is chosen like the MTP one, from expected tokens per ms at each length (it used to be a cap
+    // that grew by 2 on full acceptance and collapsed to got + 1 on any miss).
+    float la[kLaBuckets] = {kLaPrior[0], kLaPrior[1], kLaPrior[2]};
     float verify_ms[kMaxCols + 1] = {};
     float first_ms = -1.f;              // MTP pass over the accepted pairs + head (first draft)
     float step_ms = -1.f;               // each chained draft
@@ -2671,15 +2678,19 @@ float expect_geo(float a, int k) {
 }
 
 // Longest n in [n_min, n_max] such that the last n tokens of h occur earlier; returns the index of the token that
-// followed the most recent such occurrence, or -1.
-int lookup(const std::vector<int>& h, int n_min, int n_max) {
+// followed the most recent such occurrence (or -1) and the match length in *n_out.
+int lookup(const std::vector<int>& h, int n_min, int n_max, int* n_out) {
     const int L = static_cast<int>(h.size());
     for (int n = std::min(n_max, L - 1); n >= n_min; --n) {
         const int* suf = h.data() + L - n;
         for (int s = L - n - 1; s >= 0; --s) {
-            if (std::equal(suf, suf + n, h.data() + s)) return s + n;
+            if (std::equal(suf, suf + n, h.data() + s)) {
+                *n_out = n;
+                return s + n;
+            }
         }
     }
+    *n_out = 0;
     return -1;
 }
 
@@ -2760,11 +2771,14 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
     cudaEvent_t ev[4];
     for (auto& e : ev) cudaEventCreate(&e);
     int rounds = 0, drafted = 0, accepted = 0, l_rounds = 0, l_drafted = 0, l_accepted = 0;
+    int gate_tries = 0, gate_rejects = 0;
     while (emitted < n_gen && st == AK_OK && !stop) {
         const int room = n_gen - emitted - 1;  // drafts that can still be emitted
         int k = max_k;
         bool from_lookup = false;
         int at = -1;
+        int lb = 0;  // match-length bucket of this round's lookup
+        int k_mtp = 0;  // the MTP plan, run instead when a lookup candidate fails the agreement gate
         if (!o.fixed) {
             const float first = pol.first_ms > 0.f ? pol.first_ms : 3.f;
             const float step = pol.step_ms > 0.f ? pol.step_ms : 2.f;
@@ -2777,34 +2791,69 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
                 }
             }
             if (use_lookup) {
-                at = lookup(h, ng_min, ng_max);
+                int n_match = 0;
+                at = lookup(h, ng_min, ng_max, &n_match);
                 if (at >= 0) {
-                    const int L = std::min({pol.ng_len, max_k, static_cast<int>(h.size()) - at});
-                    const float fill = pol.fill_ms > 0.f ? pol.fill_ms : 1.f;
-                    if (expect_geo(pol.la, L) / (fill + est_verify(pol, L + 1)) > best) {
+                    lb = la_bucket(n_match);
+                    const int Lmax = std::min(max_k, static_cast<int>(h.size()) - at);
+                    // gated lookup rounds run the MTP head in their first pass (see the agreement gate below)
+                    const float fill = pol.la[lb] < kGateSkip ? first : (pol.fill_ms > 0.f ? pol.fill_ms : 1.f);
+                    int bestL = 0;
+                    float bestr = best;
+                    for (int L = 1; L <= Lmax; ++L) {
+                        const float r = expect_geo(pol.la[lb], L) / (fill + est_verify(pol, L + 1));
+                        if (r > bestr) {
+                            bestr = r;
+                            bestL = L;
+                        }
+                    }
+                    if (bestL > 0) {
                         from_lookup = true;
-                        k = L;
+                        k_mtp = k;
+                        k = bestL;
                     } else {
-                        pol.la += kLaPull * (kLaPrior - pol.la);
+                        pol.la[lb] += kLaPull * (kLaPrior[lb] - pol.la[lb]);
                     }
                 }
             }
         }
         k = std::max(0, std::min(k, room));
+        k_mtp = std::max(0, std::min(k_mtp, room));
         int* pt = pin_tok(m);
         pt[0] = g;
         if (from_lookup) {
             for (int i = 0; i < k; ++i) pt[1 + i] = h[at + i];
         }
+        // Agreement gate for lookup candidates: the MTP first pass also drafts d1 (its head costs ~1 ms over the
+        // plain fill), and the lookup draft is used only if its first token equals d1; otherwise this becomes the MTP
+        // round the policy would have run. A failed lookup round yields one token for a full verify, and in output
+        // that does not copy the prompt (a translation, say) n-gram matches are often wrong from the first token.
+        // Skipped when this kind of match has been reliable (learned acceptance >= kGateSkip): copying code, where the
+        // head and the extra sync per round are pure overhead (-2-4% measured).
+        const bool gate = from_lookup && k > 0 && k_mtp > 0 && pol.la[lb] < kGateSkip;
         st = ck(cudaMemcpyAsync(D.tok, pt, sizeof(int) * (from_lookup ? k + 1 : 1), cudaMemcpyHostToDevice, m->stream));
         if (st == AK_OK) st = set_ctl(m, p, commit, par, p - n_acc + 1);
         const float* hsrc = D.hbuf + static_cast<size_t>(hcol) * m->d;
-        const bool mtp_draft = !from_lookup && k > 0;
+        bool mtp_draft = !from_lookup && k > 0;
         cudaEventRecord(ev[0], m->stream);
         // MTP over the pairs (h, accepted token) at positions p - n_acc + 1 .. p: fills its KV cache and, for MTP
-        // rounds, drafts d1 from the last pair; further drafts chain on the MTP output.
-        if (st == AK_OK) st = mtp(m, n_acc, hsrc, m->d_arg + hcol, mtp_draft ? D.tok + 1 : nullptr);
+        // rounds (and gated lookup rounds), drafts d1 from the last pair; further drafts chain on the MTP output.
+        int* d1_dst = mtp_draft ? D.tok + 1 : (gate ? D.mtok : nullptr);
+        if (st == AK_OK) st = mtp(m, n_acc, hsrc, m->d_arg + hcol, d1_dst);
         cudaEventRecord(ev[1], m->stream);
+        if (gate && st == AK_OK) {
+            int* d1h = pin_mtok(m);
+            st = ck(cudaMemcpyAsync(d1h, D.mtok, sizeof(int), cudaMemcpyDeviceToHost, m->stream));
+            if (st == AK_OK) st = ck(cudaStreamSynchronize(m->stream));
+            ++gate_tries;
+            if (st == AK_OK && d1h[0] != pt[1]) {  // disagree: run the MTP plan from d1
+                ++gate_rejects;
+                from_lookup = false;
+                mtp_draft = true;
+                k = k_mtp;
+                st = ck(cudaMemcpyAsync(D.tok + 1, D.mtok, sizeof(int), cudaMemcpyDeviceToDevice, m->stream));
+            }
+        }
         for (int j = 2; mtp_draft && j <= k && st == AK_OK; ++j) {
             const int prevT = j == 2 ? n_acc : 1;
             st = mtp(m, 1, D.mh + static_cast<size_t>(prevT - 1) * m->d, D.tok + j - 1, D.tok + j);
@@ -2827,9 +2876,9 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
         cudaEventElapsedTime(&t_chain, ev[1], ev[2]);
         cudaEventElapsedTime(&t_ver, ev[2], ev[3]);
         ema(&pol.verify_ms[k + 1], t_ver);
-        if (mtp_draft) {
+        if (mtp_draft || gate) {  // a gated round's first pass ran the head too
             ema(&pol.first_ms, t_first);
-            if (k > 1) ema(&pol.step_ms, t_chain / (k - 1));
+            if (mtp_draft && k > 1) ema(&pol.step_ms, t_chain / (k - 1));
         } else {
             ema(&pol.fill_ms, t_first);
         }
@@ -2844,8 +2893,7 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
             ++l_rounds;
             l_drafted += k;
             l_accepted += got;
-            pol.ng_len = got == k ? std::min(kMaxCols - 1, pol.ng_len + 2) : std::max(2, got + 1);
-            for (int i = 0; i < std::min(got + 1, k); ++i) pol.la = 0.9f * pol.la + (i < got ? 0.1f : 0.f);
+            for (int i = 0; i < std::min(got + 1, k); ++i) pol.la[lb] = 0.9f * pol.la[lb] + (i < got ? 0.1f : 0.f);
         } else if (k > 0) {
             for (int i = 1; i <= std::min(got + 1, k); ++i) pol.acc[i] = 0.9f * pol.acc[i] + (i <= got ? 0.1f : 0.f);
         }
