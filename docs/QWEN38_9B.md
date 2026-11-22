@@ -762,6 +762,42 @@ change: 8 / 10 / 12 columns went 25.1 / 27.2 / 30.4 -> 24.2 / 26.8 / 31.9 ms, wi
 arithmetic has to earn its place, so it was reverted. With activations shared across rows, the epilogue is no
 longer what limits wide verify.
 
+## Split attention: positional slice tiers
+
+Decode and verify passes split the keys into slices: each slice is one block, writing a partial result (max, sum,
+256 accumulators) per column and query head, and `k_attn_combine` merges them. With 256-key slices, a 32k context
+has ~125 slices. At 12 columns that is ~250 MB of partials written and read back per pass, which is why a 12-column
+verify spent 6.92 ms on attention against 4.85 ms for one column, though both read the KV cache once.
+
+Attention ms per pass at T = 1 / T = 12 (`chunk_profile --pos`):
+
+| slices | 1k | 4k | 8k | 16k | 24k | 32k |
+|---|---|---|---|---|---|---|
+| 256 (before) | 0.31 / 0.40 | 0.75 / 1.05 | | 2.56 / 3.66 | | 4.85 / 6.92 |
+| 1024 | 0.73 / 0.81 | 0.74 / 0.84 | | 2.37 / 2.69 | | 4.77 / 5.75 |
+| 2048 | 0.73 / 0.81 | 1.32 / 1.41 | | 2.91 / 3.15 | | 4.51 / 4.97 |
+| 1024 -> 2048 | 0.73 / 0.81 | 0.75 / 0.83 | 1.55 / 1.78 | 2.37 / 2.71 | 3.76 / 4.37 | 4.75 / 5.36 |
+| **256 -> 1024 -> 2048 (chosen)** | **0.32 / 0.40** | 0.93 / 1.08 | **1.48 / 1.65** | 2.43 / 2.71 | **3.46 / 3.81** | 4.81 / 5.40 |
+
+- Small slices keep enough blocks busy at short context, and large ones cut the partial traffic at long context.
+  No single size wins everywhere.
+- The slice boundaries must depend only on key position. A verify pass's columns all share a block's key range,
+  while decode at the same positions runs one column at a time. If the slicing depended on the sequence length, the
+  two would merge partials differently, and speculative output could stop matching greedy.
+- So the slices are tiered by position (`split_start` / `split_count`): 256 keys below position 1024, 1024 below
+  16384, 2048 beyond.
+- Odd one out: 4k contexts are 0.2 ms slower than with flat 1024. Mixing four 256-key slices with three 1024-key
+  ones balances worse.
+
+Effect:
+- a 12-column verify pass at 16k / 24k / 32k is 1.0-1.5 ms cheaper (~3-4% of the pass);
+- below ~2.5k context, decode is ~1.5% slower (`decode_bench`: 1-2.4k-token prompts);
+- agent contexts start around 7k (the system prompt), so the trade is taken.
+
+The merge order changed, so long generations can differ in near-tied tokens from earlier builds. The long-context
+decode numbers (24k: 76 -> 85 tok/s, 36k: 58 -> 63) therefore compare different texts and are not claimed as a
+speedup. All tests pass, and llama.cpp agreement is unchanged (`llama_match`: 1351 / 1351 characters).
+
 ## Next
 
 - **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around

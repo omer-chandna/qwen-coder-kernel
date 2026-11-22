@@ -62,7 +62,27 @@ enum { kF32 = 0, kQ8 = 8, kQ4K = 12, kQ6K = 14 };
 
 constexpr int kDk = 128;         // linear-attention head size (key and value)
 constexpr int kHd = 256;         // full-attention head size
-constexpr int kAttnChunk = 256;  // keys per split-attention block
+// Split-key attention (decode / verify) gives each block one slice of keys and k_attn_combine merges the slices'
+// partial results. Slices are positional, by tier: 256 keys below position 1024, 1024 below 16384, 2048 beyond.
+// Small slices keep enough blocks busy at short context; at long context every slice costs a (258-float) partial per
+// column and head, written and read back, which made a 12-column verify pass at 32k spend 2.1 ms more on attention
+// than a 1-column one. Fixed 256 / 1024 / 2048 were each best only somewhere (docs/QWEN38_9B.md, "Split
+// attention"). Boundaries depend only on key position, so decode and verify passes split identically and speculative
+// output still equals greedy.
+constexpr int kSplitT0 = 1024, kSplitC0 = 256;
+constexpr int kSplitT1 = 16384, kSplitC1 = 1024;
+constexpr int kSplitC2 = 2048;
+constexpr int kSplitN0 = kSplitT0 / kSplitC0, kSplitN1 = (kSplitT1 - kSplitT0) / kSplitC1;
+__host__ __device__ inline int split_start(int i) {
+    if (i < kSplitN0) return i * kSplitC0;
+    if (i < kSplitN0 + kSplitN1) return kSplitT0 + (i - kSplitN0) * kSplitC1;
+    return kSplitT1 + (i - kSplitN0 - kSplitN1) * kSplitC2;
+}
+__host__ __device__ inline int split_count(int seq) {  // slices covering keys [0, seq)
+    if (seq <= kSplitT0) return (seq + kSplitC0 - 1) / kSplitC0;
+    if (seq <= kSplitT1) return kSplitN0 + (seq - kSplitT0 + kSplitC1 - 1) / kSplitC1;
+    return kSplitN0 + kSplitN1 + (seq - kSplitT1 + kSplitC2 - 1) / kSplitC2;
+}
 constexpr int kMaxCols = 12;     // widest decode / verify pass: 1 + 11 drafts
 constexpr int kSub = 8;          // delta-rule columns staged in shared memory at a time
 constexpr int kPfCols = 1024;    // default prefill chunk (AK_Q35_PF_COLS overrides); 512 -> 1024 cut TTFT 14-22% on coding prompts
@@ -765,7 +785,7 @@ __global__ void __launch_bounds__(256) k_attn_prep(const float* qk, int qk_strid
     }
 }
 
-// Split-key attention for one KV head, one slice of kAttnChunk keys and one column, all NR query heads of the group.
+// Split-key attention for one KV head, one key slice (split_start) and one column, all NR query heads of the group.
 // Column c sees keys [0, *pos + c]. Lanes hold 8 contiguous dims (one 16-byte fp16 load per key).
 // part[((c * Hq + h) * n_split + s) * (hd + 2)] = {max, sum, acc[hd]}. grid (Hkv, n_split, T), 256 threads.
 template <int NR>
@@ -781,9 +801,9 @@ __global__ void __launch_bounds__(256) k_attn_part(const float* q, const __half*
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int seq = min(*pos_p + c + 1, max_seq);
-    const int t0 = s * kAttnChunk;
+    const int t0 = split_start(s);
     if (t0 >= seq) return;
-    const int t1 = min(seq, t0 + kAttnChunk);
+    const int t1 = min(seq, split_start(s + 1));
     const float scale = rsqrtf(static_cast<float>(kHd));
     float qr[NR][8], acc[NR][8], m[NR], l[NR];
 #pragma unroll
@@ -867,7 +887,7 @@ __global__ void __launch_bounds__(256) k_attn_combine(const float* part, const f
     const int Hq = gridDim.x;
     const int dd = threadIdx.x;
     const int seq = min(*pos_p + c + 1, max_seq);
-    const int used = min(n_split, (seq + kAttnChunk - 1) / kAttnChunk);
+    const int used = min(n_split, split_count(seq));
     const float* base = part + (static_cast<size_t>(c) * Hq + h) * n_split * (kHd + 2);
     float M = -1.0e30f;
     for (int s = 0; s < used; ++s) M = fmaxf(M, base[s * (kHd + 2)]);
@@ -987,7 +1007,7 @@ __global__ void __launch_bounds__(256) k_attn_pf(const float* q, const __half* k
 // mma.m16n8k16 (fp16 in, fp32 accumulate) with an online softmax; P stays in registers (the S accumulator layout of
 // two 8-key tiles is the A-operand layout of one 16-key step).
 //   !SPLIT (prefill): all keys [0, pos + c], finalize, * sigmoid(gate) -> fp16 o-projection input.
-//   SPLIT (decode / verify): keys of chunk blockIdx.y (kAttnChunk keys) -> unnormalized partials for k_attn_combine.
+//   SPLIT (decode / verify): keys of slice blockIdx.y (split_start) -> unnormalized partials for k_attn_combine.
 // ------------------------------------------------------------------------------------------------
 
 constexpr int kAttnBK = 32;           // keys per shared-memory tile
@@ -995,7 +1015,8 @@ constexpr int kAttnRows = 64;         // query rows per block (4 warps x 16)
 constexpr int kAttnLd = kHd + 8;      // padded row stride (halves) against bank conflicts
 constexpr size_t kAttnSmem = static_cast<size_t>(kAttnRows + 2 * kAttnBK) * kAttnLd * sizeof(__half);
 static_assert(kHd == 256, "k_attn_mma assumes head dim 256 (scale 1/16)");
-static_assert(kAttnChunk % kAttnBK == 0, "split chunk must be whole key tiles");
+static_assert(kSplitC0 % kAttnBK == 0 && kSplitC1 % kAttnBK == 0 && kSplitC2 % kAttnBK == 0,
+              "split slices must be whole key tiles");
 
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, const uint32_t* b) {
     asm volatile(
@@ -1035,8 +1056,8 @@ __global__ void __launch_bounds__(128) k_attn_mma(const float* q, const __half* 
     const int seq_max = min(pos + last_row / NR + 1, max_seq);  // the block needs keys [0, seq_max)
     int k_begin = 0, k_end = seq_max;
     if (SPLIT) {
-        k_begin = split * kAttnChunk;
-        k_end = min(seq_max, k_begin + kAttnChunk);
+        k_begin = split_start(split);
+        k_end = min(seq_max, split_start(split + 1));
     }
     if (k_begin >= k_end) return;  // uniform across the block
 
@@ -1274,8 +1295,8 @@ __global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half*
     const int seq_max = min(pos + last_row / NR + 1, max_seq);
     int k_begin = 0, k_end = seq_max;
     if (SPLIT) {
-        k_begin = split * kAttnChunk;
-        k_end = min(seq_max, k_begin + kAttnChunk);
+        k_begin = split_start(split);
+        k_end = min(seq_max, split_start(split + 1));
     }
     if (k_begin >= k_end) return;
 
@@ -2438,7 +2459,7 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
     const int interval = static_cast<int>(num("full_attention_interval", 4));
     m->conv_ch = 2 * m->hk * d_state + m->d_inner;
     m->max_seq = max_seq > 0 ? max_seq : 4096;
-    m->n_split = (m->max_seq + kAttnChunk - 1) / kAttnChunk;
+    m->n_split = split_count(m->max_seq);
     const Tensor* te = f.tensors.count("token_embd.weight") ? &f.tensors["token_embd.weight"] : nullptr;
     m->vocab = te && te->dims.size() == 2 ? static_cast<int>(te->dims[1]) : 0;
     const int ratio = m->hkv ? m->hq / m->hkv : 0;
