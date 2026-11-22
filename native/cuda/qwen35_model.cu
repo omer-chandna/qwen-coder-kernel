@@ -1633,6 +1633,7 @@ template <int BN, int S, int MB>
 void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* xsd, float* y, int T, int ldy,
                 int nsplit, cudaStream_t s) {
     using namespace akd::qgemm;
+    constexpr int S6 = S > 2 ? 2 : S;  // Q6_K's 176-byte weight rows: 3 stages of 64 tokens would exceed 99 KB
     const dim3 g((T + BN - 1) / BN, (W.rows + BM - 1) / BM, nsplit);
     if (W.type == 1) {
         static bool init = false;
@@ -1645,11 +1646,11 @@ void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* x
     } else {
         static bool init = false;
         if (!init) {
-            cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq6<BN, S, MB>),
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p6_smem_bytes<BN, S>()));
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq6<BN, S6, MB>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p6_smem_bytes<BN, S6>()));
             init = true;
         }
-        k_mmq6<BN, S, MB><<<g, NT, p6_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy, nsplit);
+        k_mmq6<BN, S6, MB><<<g, NT, p6_smem_bytes<BN, S6>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy, nsplit);
     }
 }
 
@@ -1711,7 +1712,8 @@ int splitk_choose(const ak_q35_model* m, int blocks, int per_sm, int K, int T, i
 // y = A (or [A; B]) x for T columns of b's activations.
 ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a, float* y, int ystride, int T) {
     if (!b.pf) return gemv(A, B, a.q, a.d, y, ystride, T, m->stream);
-    auto int8_ok = [&](const QMat& W) { return (W.type == 1 || W.type == 2) && W.K % 256 == 0; };
+    // Q6_K: rows must start 16-byte aligned for k_mmq6's 16-byte copies (K % 2048 == 0: every Q6_K matrix here)
+    auto int8_ok = [&](const QMat& W) { return (W.type == 1 && W.K % 256 == 0) || (W.type == 2 && W.K % 2048 == 0); };
     // int8 tensor cores (qgemm.cuh) are the fastest path at every chunk length; fp16 fused / cuBLAS otherwise.
     if (m->int8_gemm && T <= m->int8_max && int8_ok(A) && (!B || (int8_ok(*B) && B->K == A.K))) {
         using namespace akd::qgemm;

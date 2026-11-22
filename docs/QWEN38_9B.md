@@ -798,23 +798,88 @@ The merge order changed, so long generations can differ in near-tied tokens from
 decode numbers (24k: 76 -> 85 tok/s, 36k: 58 -> 63) therefore compare different texts and are not claimed as a
 speedup. All tests pass, and llama.cpp agreement is unchanged (`llama_match`: 1351 / 1351 characters).
 
+## Profiling the int8 GEMM (Nsight Compute)
+
+The kernel-level diagnostics (`DIAG`) had shown no single dominant cost, so this round used a real profiler:
+Nsight Compute 2025.1.1, installed from NVIDIA's conda channel into its own environment
+(`kernel-sanders\.conda-ncu`), because the 2020.3 one on this machine predates Ada. The bench is built with
+`-lineinfo`.
+- Profiling: `ncu.exe` with `--kernel-name-base demangled`, a regex on the template arguments and `--launch-skip` to
+  pick one launch, `--set full --import-source yes`. Call `ncu.exe` directly, not `ncu.bat`: `cmd` reads the `<` of a
+  template name as redirection.
+- `benchmarks/sass_hotspots.py` summarizes the SASS export (`--page source --csv --print-source sass`) by opcode,
+  hottest instruction and bank-conflict replays.
+
+### What the profiler showed
+
+`k_mmq4<128, 2>` (ffn_gate, 512 tokens):
+- 2 warps per scheduler: 254 registers and 68 KB of shared memory each allow one block per SM.
+- Issue slots 55% busy; in 45% of cycles no warp was eligible.
+- No pipe is saturated on average: tensor (IMMA) 30%, FMA 32%, ALU 31%, LSU 36%.
+- The top stall is "math pipe throttle" on the IMMAs. The compiler already interleaves them well (pairs of IMMA, then
+  ~30 epilogue instructions), so the kernel is bound by instruction issue plus the latency that 2 warps cannot hide.
+- Barriers were only ~5% and global memory waits ~1.5%: the scale-decode phase I had suspected is minor.
+
+`k_mmq6<128, 2>` (Q6_K) added two specific problems:
+- An 8-way bank conflict on every weight-word load (344k of 393k wavefronts excess).
+- Its copy loop (31 four-byte `cp.async` per row and stage, with div / mod by 31 and branches) was ~20% of stall
+  samples in integer address math.
+
+### Changes (bench: ms per GEMM; outputs bit-identical to before, ~1e-7 against the CPU reference)
+
+1. **One `I2F` instead of the 2-op int -> float trick** (`AK_MMQ_I2F`, default 1). The 2-op form avoided I2F's
+   quarter rate, but issue slots, not the conversion pipe, are the limit. Q6_K -12%, Q4_K -1-2%.
+2. **Q6_K weight rows padded** (`P6_WS`) so a fragment load's 8 rows hit different banks: Q6_K -10-16%.
+3. **Scale tables padded to 12 floats per row** (`WSC_LD`): rows gq and gq + 4 had shared banks. Q4_K -1-3%.
+4. **Q6_K copied in 16-byte chunks.** A 210-byte super-block b sits 2 b mod 16 bytes past a 16-byte boundary,
+   uniform per stage (Q6_K matrices need K % 2048 == 0, which all here satisfy):
+   - each region is copied from the aligned-down address: 10 chunks per row instead of 31 four-byte copies;
+   - indices are (i / 128, i % 128), with no division;
+   - the last chunk uses a partial source size, so nothing past the block is read;
+   - the reader adds s & ~3 and funnel-shifts by s & 3.
+
+   Q6_K -12%. Rows are 176 bytes (44 words, conflict-free); the 64-token tile drops to 2 stages for Q6_K, because
+   3 would exceed 99 KB.
+
+| matrix, 512 tokens | before | after |
+|---|---:|---:|
+| ffn_down Q6_K (4096 x 12288) | 2.40 ms | **1.67 ms** (-30%) |
+| ssm qkv Q6_K (8192 x 4096) | 1.50 ms | **1.07 ms** (-29%) |
+| ffn_down Q4_K | 1.38 ms | 1.35 ms |
+| ffn_gate Q4_K | 1.27 ms | 1.27 ms |
+
+**Tried and rejected:**
+- **16 warps per block** (`WN = 4`: 32 x 32 warp tiles, 128 registers, kept as a template option for the bench). It
+  first spilled. Without unrolling the 64-weight loop it no longer did, and issue utilization rose to 65%, but the
+  block barrier became the top stall: 0.95-1.19x, slower at 64 tokens.
+- **Per-warp private scale decode** with 16 warps, to drop the second barrier: 0.77-0.94x. Decoding each row slab
+  once per warp cost more than the barrier.
+
+### End to end (back to back against `main`, server idle on the same GPU)
+
+| | before | after |
+|---|---:|---:|
+| 512-token chunk | 269 ms | 247 ms |
+| 32 / 64-token chunk | 42.2 / 42.1 ms | 38.2 / 38.8 ms |
+| first agent turn, 5968 tokens | 3.58 s | **3.25-3.29 s** |
+| follow-ups, 148 / 375 / 748 / 1446 tokens | 0.136 / 0.224 / 0.453 / 0.929 s | 0.127 / 0.210 / 0.414 / 0.876 s |
+
+All 26 tests pass; llama.cpp agreement unchanged (1351 / 1351 characters).
+
+**Where the GEMM stands:** Q4_K at 18-20 TMAC/s and Q6_K at 15-16 TMAC/s, against ~60 for int8 tensor cores. The
+remaining limit is the per-sub-block float epilogue (~15 issue slots per IMMA) with only 2 warps per scheduler to
+hide latency. More warps need fewer registers and less shared memory per block at once, a larger redesign (for example
+warp-specialized loading), and the 16-warp experiment shows the barrier cost then grows.
+
 ## Next
 
-Where a 512-token prefill chunk at position 0 goes now (269 ms): int8 GEMMs 235 (87%), delta rule 16, the rest
+Where a 512-token prefill chunk at position 0 goes now (247 ms): int8 GEMMs 214 (87%), delta rule 16, the rest
 (norms, conv, quantization) 13, attention 3.5. At position 32000, attention adds 108 ms. A decode step is 22.2 ms
 at short context and 26.7 at 32k (attention 4.8 ms).
 
-- **The int8 GEMMs are the main cost of prompt reading**, at 18-20 TMAC/s against ~60 for int8 tensor cores. The
-  DIAG runs (`gemm_bench.cu`) found no single dominant cause:
-  - the float epilogue is ~30% of the kernel;
-  - the per-stage scale decode and its barrier are 5-12%;
-  - copies, barriers and fragment loads make up most of the rest;
-  - reordering mmas and vectorizing scale loads did nothing or hurt.
-
-  The next step needs stall reasons per instruction. The Nsight Compute installed here (2020.3) predates Ada; a
-  current one (2023.1+) would show whether the kernel waits on shared memory, barriers or the tensor pipe. Without
-  it, the candidates are a scale decode moved off the critical path (registers, or one stage ahead) and `ldmatrix`
-  fragment loads.
+- **The int8 GEMMs** are still ~85% of prompt reading (see "Profiling the int8 GEMM"). What is left is the
+  per-sub-block float epilogue with 2 warps per scheduler. More warps need a smaller per-block footprint or
+  warp-specialized loading, and the barrier cost then grows.
 - **8-bit KV cache.** At 32k, decode attention is 18% of a step and already at bandwidth (1.07 GB in 4.8 ms), so int8
   K / V with per-32 scales would save ~2.4 ms per step (~9%) and double the context that fits in 8 GB (~40k -> ~80k).
   The cost is a dequantize step in the tensor-core attention kernel (cp.async cannot convert), which would slow

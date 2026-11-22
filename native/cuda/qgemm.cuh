@@ -308,9 +308,18 @@ __device__ __forceinline__ void mma_s8_k16(int* c, const uint32_t* a, uint32_t b
 
 __device__ __forceinline__ uint32_t ldq32(const int8_t* p) { return *reinterpret_cast<const uint32_t*>(p); }
 
-// Exact int -> float for |v| < 2^22 with two full-rate ops (I2F runs at a quarter rate): the bits of
-// 1.5 * 2^23 + v as a float, minus 1.5 * 2^23. Every int8 mma sum here is below 65536.
-__device__ __forceinline__ float i2f_small(int v) { return __int_as_float(v + 0x4B400000) - 12582912.0f; }
+// int -> float of an int8 mma sum (exact either way: |v| < 65536). AK_MMQ_I2F = 1 (default): one I2F. 0: the two
+// full-rate ops of 1.5 * 2^23 + v as float bits, minus 1.5 * 2^23. The 2-op form was chosen because I2F runs at a
+// quarter rate, but Nsight Compute showed these kernels are bound by instruction issue (2 warps per scheduler, issue
+// slots ~55% busy) with the conversion pipe mostly idle: one instruction instead of two made Q6_K 12% faster and
+// Q4_K 1-2% (docs/QWEN38_9B.md, "Profiling the int8 GEMM").
+#ifndef AK_MMQ_I2F
+#define AK_MMQ_I2F 1
+#endif
+__device__ __forceinline__ float i2f_small(int v) {
+    if constexpr (AK_MMQ_I2F) return __int2float_rn(v);
+    return __int_as_float(v + 0x4B400000) - 12582912.0f;
+}
 
 // fp16 activations [T][K] -> int8 [T][K], xd / xsd [T][K / 32]. grid (K / 256, T), 256 threads (a warp per block).
 __global__ void __launch_bounds__(256) k_quant_x8(const __half* X, int K, int8_t* xq, float* xd, float* xsd) {
@@ -656,9 +665,14 @@ template <int BN>
 __host__ __device__ constexpr size_t p4_stage_bytes() {
     return static_cast<size_t>(BM) * P4_WS + static_cast<size_t>(BN) * P4_XS + static_cast<size_t>(BN) * 8 * 4;
 }
-template <int BN, int S>
+// Row stride (floats) of the decoded-scale table of k_mmq4 / k_mmq6: 8 values per row padded to 12, so the 8 rows a
+// warp reads with one float4 load each (lanes gq = 0..7) land on 8 different bank groups; at 8 floats (32 bytes) rows
+// gq and gq + 4 shared banks (a 2-way conflict on every scale load, Nsight Compute).
+constexpr int WSC_LD = 12;
+
+template <int BN, int S, int WN = 2>
 __host__ __device__ constexpr size_t p4_smem_bytes() {
-    return S * p4_stage_bytes<BN>() + static_cast<size_t>(BM) * 8 * 4;  // + decoded scales
+    return S * p4_stage_bytes<BN>() + static_cast<size_t>(BM) * WSC_LD * 4;  // + decoded scales
 }
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem, bool valid) {
@@ -678,22 +692,28 @@ __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_gr
 // the same outputs in the same thread, and the epilogue writes fp16 silu(gate) * up to Y (as __half, ldy apart)
 // instead of two fp32 results that k_silu_quant would read back. A block covers BM / 2 = 64 rows. The accumulation is
 // k_mmq4's, and silu * up is k_silu_quant's expression, so the fp16 output is bit-identical to the two-step path.
-template <int BN, int S, int MB = 1, int DIAG = 0, bool GLU = false>
-__global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t* xq, const float* xd,
+template <int BN, int S, int MB = 1, int DIAG = 0, bool GLU = false, int WN = 2>
+__global__ void __launch_bounds__(128 * WN, MB) k_mmq4(const uint8_t* W, const int8_t* xq, const float* xd,
                                                const float* xsd, float* Y, int rows, int K, int T, int ldy,
                                                int nsplit, const uint8_t* Wu = nullptr) {
-    constexpr int TW = BN / 2;   // tokens per warp
+    // WN warps along tokens (4 rows of warps x WN): 2 = 8 warps of 32 x BN/2, 4 = 16 warps of 32 x BN/4. More warps
+    // per scheduler hide the IMMA-pair and shared-load latencies that left issue slots 45% idle with 8 (Nsight
+    // Compute, docs/QWEN38_9B.md "Profiling the int8 GEMM"); each warp then needs half the accumulators.
+    constexpr int NTH = 128 * WN;
+    constexpr int TW = BN / WN;  // tokens per warp
     constexpr int NTW = TW / 8;
     constexpr size_t SB = p4_stage_bytes<BN>();
     extern __shared__ __align__(16) uint8_t p4_smem[];
-    float* wsc = reinterpret_cast<float*>(p4_smem + S * SB);  // [BM][8]: a of 4 sub-blocks | b of 4
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
+    // decoded sub-block scales, [row][8]: a of 4 sub-blocks | b of 4. WN = 2: one table for the block's BM rows;
+    // WN = 4: each warp's private slab for its own 32 rows (see the decode below).
+    float* wsc = reinterpret_cast<float*>(p4_smem + S * SB);
     const int lane = tid & 31;
     const int gq = lane >> 2;
     const int tig = lane & 3;
-    const int wm = warp >> 1;
-    const int wn = warp & 1;
+    const int wm = warp / WN;
+    const int wn = warp % WN;
     const int c0 = blockIdx.x * BN;
     const int r0 = blockIdx.y * (GLU ? BM / 2 : BM);
     const int KB = K / 32;
@@ -725,7 +745,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
         const int b = k0 >> 8;
         const int h = (k0 >> 7) & 1;
         uint8_t* ws = wraw(st);
-        for (int i = tid; i < BM * 5; i += NT) {
+        for (int i = tid; i < BM * 5; i += NTH) {
             const int r = i / 5, ch = i - r * 5;
             const uint8_t* mat;
             const int mr = r0 + src_row(r, mat);
@@ -734,13 +754,13 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
             cp_async16(ws + r * P4_WS + ch * 16, ch == 0 ? blk : blk + 16 + h * 64 + (ch - 1) * 16, ok);
         }
         int8_t* xs = xsm(st);
-        for (int i = tid; i < BN * (P4_BK / 16); i += NT) {
+        for (int i = tid; i < BN * (P4_BK / 16); i += NTH) {
             const int n = i >> 3, ch = i & 7;
             const bool ok = c0 + n < T;
             cp_async16(xs + n * P4_XS + ch * 16, xq + (ok ? static_cast<size_t>(c0 + n) * K : 0) + k0 + ch * 16, ok);
         }
         float* sc = xsc(st);  // per token: [xd of the stage's four 32-blocks | xsd of them]
-        for (int i = tid; i < BN * 2; i += NT) {
+        for (int i = tid; i < BN * 2; i += NTH) {
             const int n = i >> 1, which = i & 1;
             const bool ok = c0 + n < T;
             const float* src = (which ? xsd : xd) + (ok ? static_cast<size_t>(c0 + n) * KB : 0) + k0 / 32;
@@ -764,9 +784,10 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
         __syncthreads();  // stage kt landed for every thread; stage kt - 1 and wsc are free
         const int st = kt % S;
         const int h = ((kt * P4_BK) >> 7) & 1;
-        if constexpr (DIAG != 6) {  // sub-block scales of this stage: BM rows x 4 sub-blocks (global sub-block 4h + sb)
+        // Sub-block scales of this stage (global sub-block 4h + sb), decoded by the whole block, then a barrier.
+        if constexpr (DIAG != 6) {
             const uint8_t* ws = wraw(st);
-            for (int i = tid; i < BM * 4; i += NT) {
+            for (int i = tid; i < BM * 4; i += NTH) {
                 const int r = i >> 2, sb = i & 3;
                 const uint8_t* hd = ws + r * P4_WS;
                 const float2 dm = __half22float2(*reinterpret_cast<const __half2*>(hd));
@@ -780,8 +801,8 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
                     sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
                     mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
                 }
-                wsc[r * 8 + (sb >> 1) * 4 + (sb & 1)] = dm.x * static_cast<float>(sc);  // [jj][a lo, a hi, b lo, b hi]
-                wsc[r * 8 + (sb >> 1) * 4 + 2 + (sb & 1)] = dm.y * static_cast<float>(mn);
+                wsc[r * WSC_LD + (sb >> 1) * 4 + (sb & 1)] = dm.x * static_cast<float>(sc);  // [jj][a lo, a hi, b lo, b hi]
+                wsc[r * WSC_LD + (sb >> 1) * 4 + 2 + (sb & 1)] = dm.y * static_cast<float>(mn);
             }
         }
         if constexpr (DIAG != 6) __syncthreads();
@@ -791,7 +812,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
         const uint8_t* ws = wraw(st);
         const int8_t* xs = xsm(st);
         const float* xc = xsc(st);
-#pragma unroll
+#pragma unroll (WN == 2 ? 2 : 1)  // 16 warps have 128 registers: one 64-weight step's fragments live at a time
         for (int jj = 0; jj < 2; ++jj) {  // 64-weight group: low nibbles = sub-block 2jj, high = 2jj + 1
             uint32_t alo[2][4], ahi[2][4];
             float ra[2][2][2], rb[2][2][2];  // [mt][row g / g+8][lo / hi]
@@ -810,7 +831,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
                 }
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
-                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + (r + 8 * e) * 8 + jj * 4);
+                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + (r + 8 * e) * WSC_LD + jj * 4);
                     ra[mt][e][0] = w4.x;
                     ra[mt][e][1] = w4.y;
                     rb[mt][e][0] = w4.z;
@@ -897,15 +918,22 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
 }
 
 // ================================================================================================
-// Pipelined Q6_K int8 GEMM, same structure as k_mmq4. A 210-byte super-block starts 2 bytes off 4-byte alignment
-// when its index is odd (rows are 4-aligned: K / 256 is even here), so each stage copies the regions it needs with
-// 4-byte cp.async from the aligned-down address and reads words back with a 16-bit funnel shift when sh = 2 (uniform
-// across the block: it depends only on the super-block index). Per row and 128-wide K half h:
-//   ql[64 h .. +64) -> 17 words, qh[128 + 32 h .. +32) -> 9 words, scales + d [192 .. 210) -> 5 words.
-// The last word can read 2 bytes past the super-block, which stays inside the weight allocation.
+// Pipelined Q6_K int8 GEMM, same structure as k_mmq4. A 210-byte super-block b starts s = 2 b mod 16 bytes past a
+// 16-byte boundary (rows are 16-aligned: K % 2048 == 0), uniform across the block for a stage. Each stage copies the
+// three regions it needs per row and 128-wide K half h as 16-byte cp.async chunks from the 16-byte-aligned-down
+// address, into windows of the row's smem slot:
+//   ql[64 h .. +64) -> 5 chunks at P6_QL, qh[128 + 32 h .. +32) -> 3 chunks at P6_QH, scales + d [192 .. 210) ->
+//   2 chunks at P6_SC (the last one with a partial source size, so nothing past the super-block is read).
+// Logical byte L of a region is at window offset s + L; 4-byte words are read from s & ~3 with a 16-bit funnel
+// shift when s & 3 == 2. This replaced 31 four-byte copies per row and stage, whose index math (div / mod by 31,
+// branches) was ~20% of the kernel's stall samples in Nsight Compute.
 // ================================================================================================
 
-constexpr int P6_WS = 128;  // smem bytes per weight row and stage: ql 68 | qh 36 | scales + d 20 (+ pad)
+constexpr int P6_QL = 0, P6_QH = 80, P6_SC = 128;
+// smem bytes per weight row and stage: 160 used. 176 = 44 words, so the 8 rows of a fragment load hit banks
+// 12 gq + tig (mod 32), all different; 128 (32 words) gave an 8-way conflict on every weight word read (Nsight
+// Compute: 344k of 393k wavefronts excess per load), 160 (40 words) would be 2-way.
+constexpr int P6_WS = 176;
 
 template <int BN>
 __host__ __device__ constexpr size_t p6_stage_bytes() {
@@ -913,7 +941,13 @@ __host__ __device__ constexpr size_t p6_stage_bytes() {
 }
 template <int BN, int S>
 __host__ __device__ constexpr size_t p6_smem_bytes() {
-    return S * p6_stage_bytes<BN>() + static_cast<size_t>(BM) * 8 * 4;
+    return S * p6_stage_bytes<BN>() + static_cast<size_t>(BM) * WSC_LD * 4;
+}
+
+// 16-byte cp.async of which only the first n bytes are read from global memory (the rest is zero-filled).
+__device__ __forceinline__ void cp_async16_n(void* smem, const void* gmem, int n) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(n));
 }
 
 __device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool valid) {
@@ -956,24 +990,25 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
         const int k0 = kt * P4_BK;
         const int b = k0 >> 8;
         const int h = (k0 >> 7) & 1;
-        const int sh = (b & 1) * 2;  // super-block start mod 4
+        const int s16 = (2 * b) & 15;  // super-block start mod 16
         uint8_t* ws = wraw(st);
-        for (int i = tid; i < BM * 31; i += NT) {
-            const int r = i / 31, w = i - r * 31;
+        for (int i = tid; i < BM * 10; i += NT) {  // chunk c of row r: (c, r) = (i / BM, i % BM), BM a power of 2
+            const int r = i & (BM - 1), c = i / BM;
             const bool ok = r0 + r < rows;
-            const uint8_t* blk = W + (ok ? (r0 + r) * row_bytes : 0) + static_cast<size_t>(b) * 210 - sh;
-            int src, dst;
-            if (w < 17) {
-                src = h * 64 + 4 * w;
-                dst = 4 * w;
-            } else if (w < 26) {
-                src = 128 + h * 32 + 4 * (w - 17);
-                dst = 68 + 4 * (w - 17);
+            const uint8_t* blk = W + (ok ? (r0 + r) * row_bytes : 0) + static_cast<size_t>(b) * 210;
+            int src, dst, n = 16;
+            if (c < 5) {
+                src = h * 64 - s16 + 16 * c;
+                dst = P6_QL + 16 * c;
+            } else if (c < 8) {
+                src = 128 + h * 32 - s16 + 16 * (c - 5);
+                dst = P6_QH + 16 * (c - 5);
             } else {
-                src = 192 + 4 * (w - 26);
-                dst = 104 + 4 * (w - 26);
+                src = 192 - s16 + 16 * (c - 8);
+                dst = P6_SC + 16 * (c - 8);
+                if (c == 9) n = 2 + s16;  // stop at byte 210
             }
-            cp_async4(ws + r * P6_WS + dst, blk + src, ok);
+            cp_async16_n(ws + r * P6_WS + dst, blk + src, ok ? n : 0);
         }
         int8_t* xs = xsm(st);
         for (int i = tid; i < BN * (P4_BK / 16); i += NT) {
@@ -1004,14 +1039,15 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
         __syncthreads();
         const int st = kt % S;
         const int h = ((kt * P4_BK) >> 7) & 1;
-        const int sh = ((kt * P4_BK) >> 8 & 1) * 2;
+        const int s16 = (2 * ((kt * P4_BK) >> 8)) & 15;  // as in issue()
+        const int sh = s16 & 3, s4 = s16 & ~3;
         const uint8_t* ws = wraw(st);
         for (int i = tid; i < BM * 8; i += NT) {  // d * scale of the 8 16-groups of this half
             const int r = i >> 3, g = i & 7;
-            const uint8_t* s3 = ws + r * P6_WS + 104 + sh;  // logical byte 192
+            const uint8_t* s3 = ws + r * P6_WS + P6_SC + s16;  // logical byte 192
             const float d = __half2float(*reinterpret_cast<const __half*>(s3 + 16));
             // 16-group g = 2 q + lg -> [lg][q], so one 128-bit load gives a row's four scales for one lg
-            wsc[r * 8 + (g & 1) * 4 + (g >> 1)] = d * static_cast<float>(static_cast<int8_t>(s3[h * 8 + g]));
+            wsc[r * WSC_LD + (g & 1) * 4 + (g >> 1)] = d * static_cast<float>(static_cast<int8_t>(s3[h * 8 + g]));
         }
         __syncthreads();
         if (kt + S - 1 < kt0 + nk) issue(kt + S - 1);
@@ -1035,14 +1071,15 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
                     const int r = wm * 32 + mt * 16 + gq + 8 * e;
                     const uint8_t* rowp = ws + r * P6_WS;
                     const int l = lg * 16 + tig * 4;
-                    const uint32_t qa = word(rowp + l), qb = word(rowp + 32 + l), qc = word(rowp + 68 + l);
+                    const uint32_t qa = word(rowp + P6_QL + s4 + l), qb = word(rowp + P6_QL + s4 + 32 + l),
+                                   qc = word(rowp + P6_QH + s4 + l);
                     // q - 32 per byte for q in [0, 63]: q + 0x60 cannot carry into the next byte, and flipping bit 7
                     // subtracts 128 mod 256 (2 ops; __vsub4 has no native instruction on sm_89 and is emulated)
                     a[mt][0][e] = (((qa & 0x0F0F0F0Fu) | ((qc << 4) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
                     a[mt][1][e] = (((qb & 0x0F0F0F0Fu) | ((qc << 2) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
                     a[mt][2][e] = ((((qa >> 4) & 0x0F0F0F0Fu) | (qc & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
                     a[mt][3][e] = ((((qb >> 4) & 0x0F0F0F0Fu) | ((qc >> 2) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
-                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + r * 8 + lg * 4);
+                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + r * WSC_LD + lg * 4);
                     rs[mt][e][0] = w4.x;
                     rs[mt][e][1] = w4.y;
                     rs[mt][e][2] = w4.z;

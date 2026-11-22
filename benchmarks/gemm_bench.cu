@@ -141,31 +141,33 @@ void dequant_row(int type, const uint8_t* row, int K, std::vector<double>& out) 
     }
 }
 
-template <int DIAG>
+template <int DIAG, int WN = 2>
 void launch(int type, int T, const uint8_t* W, int rows, int K, const int8_t* xq, const float* xd, const float* xsd,
             float* Y, int nsplit = 1) {
     using namespace akd::qgemm;
     auto go = [&](auto bn_tag, auto s_tag) {
         constexpr int BN = decltype(bn_tag)::value, S = decltype(s_tag)::value;
+        constexpr int S6 = S > 2 ? 2 : S;  // as mmq_launch
         const dim3 g((T + BN - 1) / BN, (rows + BM - 1) / BM, nsplit);
         if (type == 1) {
             static bool init = false;
             if (!init) {
-                CK(cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq4<BN, S, 1, DIAG>),
+                CK(cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq4<BN, S, 1, DIAG, false, WN>),
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(p4_smem_bytes<BN, S>())));
+                                        static_cast<int>(p4_smem_bytes<BN, S, WN>())));
                 init = true;
             }
-            k_mmq4<BN, S, 1, DIAG><<<g, NT, p4_smem_bytes<BN, S>()>>>(W, xq, xd, xsd, Y, rows, K, T, rows, nsplit);
+            k_mmq4<BN, S, 1, DIAG, false, WN><<<g, 128 * WN, p4_smem_bytes<BN, S, WN>()>>>(W, xq, xd, xsd, Y, rows, K, T,
+                                                                                      rows, nsplit);
         } else {
             static bool init = false;
             if (!init) {
-                CK(cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq6<BN, S, 1, DIAG>),
+                CK(cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq6<BN, S6, 1, DIAG>),
                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(p6_smem_bytes<BN, S>())));
+                                        static_cast<int>(p6_smem_bytes<BN, S6>())));
                 init = true;
             }
-            k_mmq6<BN, S, 1, DIAG><<<g, NT, p6_smem_bytes<BN, S>()>>>(W, xq, xd, xsd, Y, rows, K, T, rows, nsplit);
+            k_mmq6<BN, S6, 1, DIAG><<<g, NT, p6_smem_bytes<BN, S6>()>>>(W, xq, xd, xsd, Y, rows, K, T, rows, nsplit);
         }
     };
     // The runtime's default configurations: cfg 0 (BN 64, 3 stages) up to 64 tokens, cfg 2 (BN 128, 2 stages) above.
@@ -244,6 +246,14 @@ int main() {
             float t2 = 0.f, t3 = 0.f;
             if (M.type == 1) t2 = time_ms([&] { launch<2>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
             if (M.type == 1) {
+                // 16-warp layout: same arithmetic per output, so the result must be bit-identical
+                launch<0, 4>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Ys);
+                CK(cudaDeviceSynchronize());
+                std::vector<float> y4(hy.size());
+                CK(cudaMemcpy(y4.data(), Ys, y4.size() * 4, cudaMemcpyDeviceToHost));
+                const float t4w = time_ms([&] { launch<0, 4>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Ys); });
+                std::printf("   16 warps (WN 4): %.3f ms (%.2fx), identical: %s\n", t4w, t0 / t4w,
+                            std::memcmp(y4.data(), hy.data(), y4.size() * 4) == 0 ? "yes" : "NO");
                 t3 = time_ms([&] { launch<4>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
                 const float t5 = time_ms([&] { launch<5>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });
                 const float t6 = time_ms([&] { launch<6>(M.type, T, W, M.rows, M.K, xq, xd, xsd, Y); });

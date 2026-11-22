@@ -23,7 +23,7 @@ $vcvars = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2022\BuildTools\VC\A
 New-Item -ItemType Directory -Force "$Root\build-dev" | Out-Null
 $exe = "$Root\build-dev\${Bench}_bench.exe"
 $src = "$Root\benchmarks\${Bench}_bench.cu"
-$cmd = "`"$vcvars`" >nul && `"$CudaRoot\bin\nvcc.exe`" -arch=sm_89 -O3 -std=c++17 -I`"$Root\include`" -I`"$Root\native\cuda`" -I`"$CudaRoot\include`" -Xcompiler /EHsc -diag-suppress 550,177 -o `"$exe`" `"$src`" -L`"$CudaRoot\lib`" -L`"$CudaRoot\lib\x64`" -lcublas"
+$cmd = "`"$vcvars`" >nul && `"$CudaRoot\bin\nvcc.exe`" -arch=sm_89 -O3 -std=c++17 -lineinfo $env:AK_BENCH_FLAGS -I`"$Root\include`" -I`"$Root\native\cuda`" -I`"$CudaRoot\include`" -Xcompiler /EHsc -diag-suppress 550,177 -o `"$exe`" `"$src`" -L`"$CudaRoot\lib`" -L`"$CudaRoot\lib\x64`" -lcublas"
 cmd /c $cmd
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 $env:PATH = "$CudaRoot\bin;" + $env:PATH
