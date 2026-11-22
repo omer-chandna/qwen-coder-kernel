@@ -447,11 +447,17 @@ AK_API ak_status ak_q35_cache_load(ak_q35_model* model, int slot);
 AK_API ak_status ak_q35_set_prefill(ak_q35_model* model, int batched);
 /* Attention kernels: 1 (default) tensor-core tiled, 0 the older per-column scalar ones (also AK_Q35_ATTN_OLD=1). */
 AK_API ak_status ak_q35_set_attn(ak_q35_model* model, int tensor_core);
+/* Prefill chunks of up to max_cols tokens use the fused quantized-weight GEMM, longer ones fp16 expansion + cuBLAS
+   (0: always cuBLAS, < 0: always fused). Also AK_Q35_QGEMM_MAX. */
+AK_API ak_status ak_q35_set_qgemm(ak_q35_model* model, int max_cols);
 /* Logits after the last prompt token. */
 AK_API ak_status ak_q35_logits(ak_q35_model* model, const int32_t* prompt, int n_prompt, int use_graph,
                                float* logits);
 /* GPU ms of one eager decode step per kernel kind; arrays hold n_kinds (>= 18) entries. */
 AK_API ak_status ak_q35_profile(ak_q35_model* model, float* ms_by_kind, int32_t* count_by_kind, int n_kinds);
+/* The same for one pass of T columns at position pos (T > max_cols: one batched prefill chunk, T <= chunk length). */
+AK_API ak_status ak_q35_profile_prefill(ak_q35_model* model, int T, int pos, float* ms_by_kind,
+                                        int32_t* count_by_kind, int n_kinds);
 
 #ifdef __cplusplus
 }

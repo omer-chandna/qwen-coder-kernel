@@ -179,13 +179,55 @@ The first 32 generated tokens were identical between the two kernels at every si
 | 24k | 36.4 s -> 27.2 s (1.34x) | 51.9 -> 55.3 tok/s |
 | 36k | 66.4 s -> 45.8 s (1.45x) | 42.9 -> 52.6 tok/s |
 
-At 36k, attention is now roughly 13 s of the 46 s. The remaining ~33 s is the per-token cost of everything else
-(~1100 tok/s), mostly the sequential Gated DeltaNet recurrence.
+## Where prefill time goes (`Qwen35Model.profile(T, pos)`)
+
+One 512-token chunk, RTX 4060:
+
+| kernel kind | at pos 0 | at pos 32000 |
+|---|---|---|
+| matrix products (FFN, projections) | 353 ms (84%) | 345 ms (45%) |
+| attention (`k_attn_mma`) | 4 ms | 360 ms (47%) |
+| Gated DeltaNet recurrence | 43 ms (10%) | 42 ms (5%) |
+| everything else | 22 ms | 21 ms |
+
+So the sequential delta-rule recurrence is not the bottleneck: a chunked (WY / UT-transform) rewrite could save at
+most ~10%. The matrix products are, and their time was a fixed ~130-180 ms per chunk (expanding every Q4_K / Q6_K
+matrix to fp16, ~13 GB written and read back) plus ~0.43 ms per token in cuBLAS. That fixed part made short chunks,
+which is what cached agent turns produce, cost nearly as much as 512-token ones.
+
+## Fused quantized-weight GEMM (`qgemm.cuh`)
+
+`k_qgemm` decodes each 128-row x 64-K weight tile straight from the Q4_K / Q6_K blocks into shared memory, with the
+same fp16 rounding as the expansion kernel, and multiplies it with `mma.m16n8k16` (fp32 accumulate). So no fp16 copy
+of the matrix is ever written. The next tile's raw bytes are fetched into registers while the current one is
+multiplied. Token tiles are 64 wide for chunks of up to 128 tokens and 128 wide above that. Chunks of up to 768
+tokens use it; cuBLAS remains for longer ones (`set_qgemm` / `AK_Q35_QGEMM_MAX`). The 100 MB fp16 scratch is now
+only allocated if a cuBLAS chunk ever runs.
+
+GEMM ms per chunk, cuBLAS incl. expansion -> fused:
+
+| T = 64 | 128 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| 189 -> 63 | 198 -> 101 | 244 -> 175 | 354 -> 320 | 572 -> 611 | 1018 -> 1213 |
+
+Logits match cuBLAS to a correlation of 0.999994. End to end (`benchmarks/followup.py`, 40k context, 512-token
+chunks):
+- First agent turn, 6.0k tokens: 5.66 -> 5.12 s.
+- Follow-up turns adding 387 / 771 / 1432 tokens: 0.45 -> 0.38, 0.88 -> 0.77 and 1.57 -> 1.49 s.
+- First read of a 36k prompt: 45.8 -> 43.5 s.
+
+The kernel is still ~35% less efficient per token than cuBLAS at large T, because decoding and multiplying are not
+overlapped across tiles.
+
+I also tried fp16 accumulation in cuBLAS (2x tensor rate on GeForce). It cut GEMM time per 512-token chunk only from
+350 to 282 ms, and greedy output diverged after 55 tokens on one of three prompts. Not adopted.
 
 ## Next
 
-- Prefill is now limited by the recurrent layers, not attention: move to a chunked (WY / UT-transform) delta rule so
-  the 24 Gated DeltaNet layers also run on tensor cores.
-- `k_attn_mma` itself: cp.async double-buffering of the K/V tiles and `ldmatrix` fragment loads (it currently waits
-  on each tile load and packs V fragments element by element).
+- **int8 tensor cores for the matrix products.** This is where llama.cpp's 2x prefill lead comes from. On Ada
+  GeForce, int8 mma runs at about 4x the rate of fp16 with fp32 accumulate. The fused kernel's structure carries
+  over: decode the nibbles to int8 instead of fp16, quantize activations to int8 per 32 values (as the decode path
+  already does), run `mma.m16n8k32.s8`, and apply the Q4_K scale/min per 32-wide sub-block.
+- `k_attn_mma` (47% of a chunk at 32k): cp.async double-buffering of the K/V tiles, `ldmatrix` fragment loads and
+  more warps per block. Only one 4-warp block fits per SM today.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

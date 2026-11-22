@@ -185,3 +185,21 @@ def test_tensor_core_decode_matches_scalar(model):
         model.set_attention(True)
     same = int(np.argmax(new != old)) if (new != old).any() else len(new)
     assert same >= 40, f"tensor-core and scalar decode diverge at token {same}"
+
+
+def test_fused_quantized_gemm_matches_cublas(model):
+    """Prefill with the fused dequant + mma GEMM (both token-tile widths) against fp16 expansion + cuBLAS."""
+    ids = tokenize(MODEL, _long_prompt())
+    try:
+        model.set_qgemm(0)
+        ref = model.logits(ids)
+        model.set_qgemm(-1)
+        fused = model.logits(ids)  # chunks > 128 columns: 128-token tiles
+        short = model.logits(ids[:100])
+        model.set_qgemm(0)
+        short_ref = model.logits(ids[:100])  # 64-token tiles
+    finally:
+        model.set_qgemm(768)
+    for a, b in ((ref, fused), (short_ref, short)):
+        assert int(np.argmax(a)) == int(np.argmax(b))
+        assert np.corrcoef(a, b)[0, 1] > 0.9999

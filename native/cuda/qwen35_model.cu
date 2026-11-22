@@ -33,6 +33,7 @@
 // The token embedding table lives in pinned host memory (one row per token over PCIe).
 
 #include "dequant.cuh"
+#include "qgemm.cuh"
 #include "error.h"
 #include "launch.h"
 #include "ops.cuh"
@@ -292,6 +293,8 @@ struct ak_q35_model {
     int pf_cols = kPfCols;
     bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
     bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
+    int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
+                                         // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
     int draft_vocab = 0;                 // rows of the LM head the MTP draft scores (a prefix of the vocab)
     __half* w16 = nullptr;               // one matrix expanded to fp16 (prefill)
     size_t w16_n = 0;
@@ -1211,9 +1214,30 @@ ak_status gemv(const QMat& A, const QMat* B, const int8_t* xq, const float* xd, 
 
 // Prefill matrix product: Y[c][0..rows) (row stride ldy) = W . X[c], X fp16 [T][W.K]. W is expanded to fp16 into
 // m->w16, then cuBLAS (tensor cores, fp32 accumulate).
+// Prefill matrix product for one chunk. Up to qgemm_max columns the fused dequant + mma kernel (qgemm.cuh) reads the
+// 4/6-bit weights directly; longer chunks expand the matrix to fp16 once and use cuBLAS.
 ak_status pf_gemm(ak_q35_model* m, const QMat& W, const __half* X, int T, float* Y, int ldy) {
     cudaStream_t s = m->stream;
+    if (T <= m->qgemm_max && (W.type == 1 || W.type == 2) && W.K % 256 == 0) {
+        using namespace akd::qgemm;
+        auto launch = [&](auto kern, int bn) {
+            kern<<<dim3((T + bn - 1) / bn, (W.rows + BM - 1) / BM), NT, 0, s>>>(W.w, X, Y, W.rows, W.K, T, ldy);
+        };
+        if (T <= 128) {
+            if (W.type == 1) launch(k_qgemm<1, 64>, 64);
+            else launch(k_qgemm<2, 64>, 64);
+        } else {
+            if (W.type == 1) launch(k_qgemm<1, 128>, 128);
+            else launch(k_qgemm<2, 128>, 128);
+        }
+        return ck(cudaGetLastError());
+    }
     const size_t n = static_cast<size_t>(W.rows) * W.K;
+    if (!m->w16) {  // only chunks longer than qgemm_max need it (~100 MB for this model)
+        const ak_status st = dalloc_n(m, &m->w16, m->w16_n);
+        if (st != AK_OK) return st;
+        m->info.vram_mb = static_cast<float>(m->dev_bytes / (1024.0 * 1024.0));
+    }
     if (n > m->w16_n) {
         ak_set_error("qwen35 prefill: fp16 scratch too small");
         return AK_ERR_INVALID;
@@ -1604,8 +1628,11 @@ ak_status ensure_pf(ak_q35_model* m) {
     if (st == AK_OK) {
         cublasSetStream(m->blas, m->stream);
         cublasSetMathMode(m->blas, CUBLAS_DEFAULT_MATH);
-        st = dalloc_n(m, &m->w16, wmax);
-        m->w16_n = wmax;
+        m->w16_n = wmax;  // the fp16 scratch itself is allocated on the first cuBLAS chunk (pf_gemm)
+    }
+    {
+        const char* qg = std::getenv("AK_Q35_QGEMM_MAX");
+        if (qg) m->qgemm_max = std::atoi(qg);
     }
     if (st == AK_OK) st = ck(cudaHostAlloc(reinterpret_cast<void**>(&m->h_pf), sizeof(int) * 2 * cols, 0));
     Bufs b;
@@ -2401,6 +2428,15 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
     return st;
 }
 
+extern "C" ak_status ak_q35_set_qgemm(ak_q35_model* m, int max_cols) {
+    if (!m) {
+        ak_set_error("qwen35 set_qgemm: null model");
+        return AK_ERR_INVALID;
+    }
+    m->qgemm_max = max_cols < 0 ? (1 << 30) : max_cols;
+    return AK_OK;
+}
+
 extern "C" ak_status ak_q35_set_prefill(ak_q35_model* m, int batched) {
     if (!m) {
         ak_set_error("qwen35 set_prefill: null model");
@@ -2431,7 +2467,14 @@ extern "C" ak_status ak_q35_logits(ak_q35_model* m, const int32_t* prompt, int n
 // GPU time of one eager T = 1 decode step by kernel kind (kKCount buckets, see Kind above). Runs at position 0
 // with the current state; meant for timing only.
 extern "C" ak_status ak_q35_profile(ak_q35_model* m, float* ms_by_kind, int32_t* count_by_kind, int n_kinds) {
-    if (!m || !ms_by_kind || !count_by_kind || n_kinds < kKCount) {
+    return ak_q35_profile_prefill(m, 1, 0, ms_by_kind, count_by_kind, n_kinds);
+}
+
+// GPU time by kernel kind of one pass of T columns at position pos (T > max_cols: one batched prefill chunk on the
+// prefill buffers). Token ids and the state are whatever the buffers hold; meant for timing only.
+extern "C" ak_status ak_q35_profile_prefill(ak_q35_model* m, int T, int pos, float* ms_by_kind,
+                                            int32_t* count_by_kind, int n_kinds) {
+    if (!m || !ms_by_kind || !count_by_kind || n_kinds < kKCount || T < 1 || pos < 0 || pos + T > m->max_seq) {
         ak_set_error("qwen35 profile: bad arguments");
         return AK_ERR_INVALID;
     }
@@ -2439,10 +2482,20 @@ extern "C" ak_status ak_q35_profile(ak_q35_model* m, float* ms_by_kind, int32_t*
         ms_by_kind[i] = 0.f;
         count_by_kind[i] = 0;
     }
-    ak_status st = set_ctl(m, 0, 0, 0, 0);
+    ak_status st = AK_OK;
+    const bool pf = T > kMaxCols;
+    if (pf) {
+        st = ensure_pf(m);
+        if (st == AK_OK && T > m->pf_cols) {
+            ak_set_error("qwen35 profile: T exceeds the prefill chunk length");
+            return AK_ERR_INVALID;
+        }
+        if (st == AK_OK) st = ck(cudaMemsetAsync(m->pf.tok, 0, sizeof(int) * T, m->stream));
+    }
+    if (st == AK_OK) st = set_ctl(m, pos, 0, 0, 0);
     Prof p;
     mark(&p, m->stream, -1);
-    if (st == AK_OK) st = emit_target(m, m->dec, 1, 1, &p);
+    if (st == AK_OK) st = emit_target(m, pf ? m->pf : m->dec, T, pf ? 0 : 1, &p);
     if (st == AK_OK) st = ck(cudaStreamSynchronize(m->stream));
     for (size_t i = 1; i < p.ev.size() && st == AK_OK; ++i) {
         float ms = 0.f;

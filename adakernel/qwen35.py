@@ -113,10 +113,14 @@ def _bind(lib) -> None:
     lib.ak_q35_set_prefill.restype = ctypes.c_int
     lib.ak_q35_set_attn.argtypes = [vp, ctypes.c_int]
     lib.ak_q35_set_attn.restype = ctypes.c_int
+    lib.ak_q35_set_qgemm.argtypes = [vp, ctypes.c_int]
+    lib.ak_q35_set_qgemm.restype = ctypes.c_int
     lib.ak_q35_logits.argtypes = [vp, vp, ctypes.c_int, ctypes.c_int, vp]
     lib.ak_q35_logits.restype = ctypes.c_int
     lib.ak_q35_profile.argtypes = [vp, vp, vp, ctypes.c_int]
     lib.ak_q35_profile.restype = ctypes.c_int
+    lib.ak_q35_profile_prefill.argtypes = [vp, ctypes.c_int, ctypes.c_int, vp, vp, ctypes.c_int]
+    lib.ak_q35_profile_prefill.restype = ctypes.c_int
     lib._q35_bound = True
 
 
@@ -342,6 +346,10 @@ class Qwen35Model:
         """True (default): tensor-core tiled attention; False: the older per-column scalar kernels."""
         self.native.check(self.native.lib.ak_q35_set_attn(self.handle, int(tensor_core)))
 
+    def set_qgemm(self, max_cols: int) -> None:
+        """Prefill chunks of up to max_cols tokens use the fused quantized GEMM (0: always cuBLAS, -1: always fused)."""
+        self.native.check(self.native.lib.ak_q35_set_qgemm(self.handle, int(max_cols)))
+
     def logits(self, prompt, graph: bool = True) -> np.ndarray:
         tokens = np.ascontiguousarray(prompt, dtype=np.int32)
         out = np.empty(self.info["vocab"], dtype=np.float32)
@@ -351,11 +359,12 @@ class Qwen35Model:
         )
         return out
 
-    def profile(self) -> dict:
+    def profile(self, T: int = 1, pos: int = 0) -> dict:
+        """GPU ms by kernel kind of one pass: T = 1 a decode step, T > 12 one batched prefill chunk at pos."""
         n = len(PROFILE_KINDS)
         ms = np.zeros(n, dtype=np.float32)
         cnt = np.zeros(n, dtype=np.int32)
         self.reset_cache()
-        self.reset_cache()
-        self.native.check(self.native.lib.ak_q35_profile(self.handle, Native._ptr(ms), Native._ptr(cnt), n))
+        self.native.check(self.native.lib.ak_q35_profile_prefill(self.handle, int(T), int(pos), Native._ptr(ms),
+                                                                 Native._ptr(cnt), n))
         return {k: (float(ms[i]), int(cnt[i])) for i, k in enumerate(PROFILE_KINDS) if cnt[i]}
