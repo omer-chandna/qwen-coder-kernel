@@ -382,16 +382,138 @@ file-local kernels with the model's shapes, with no model load (~150 MB of VRAM)
 inputs and compares the outputs byte for byte. A kernel change can be validated in seconds, and while another
 process holds most of the GPU.
 
+## Agent turns: where the int8 GEMM time goes, split-K, snapshots inside a chunk
+
+This round started from the int8 GEMM (the largest prefill cost after attention v2) and ended up mostly speeding up
+**agent follow-up turns** (100-800 new tokens on a cached prefix), which is what an OpenCode session spends most of
+its prompt time on.
+
+### Measuring the GEMM in isolation (`benchmarks/gemm_bench.cu`)
+
+`scripts\cuda_bench.ps1 -Bench gemm` runs `k_mmq4` / `k_mmq6` on random, well-formed Q4_K / Q6_K weights at the
+model's shapes (no model load). It checks sampled outputs against a CPU fp64 reference that uses the same Q8_1
+activations: the max relative error is ~1e-7, so the arithmetic is exact up to float rounding. It also times
+diagnostic variants (template parameter `DIAG`, compiled out of the runtime) that are wrong by design but show
+where time goes. Matrix shapes and types come from the GGUF tensor table:
+- Q4_K: FFN gate / up, half of FFN down, half of the DeltaNet qkv projections.
+- Q6_K: the other halves, plus some attn_v.
+
+FFN gate (12288 x 4096, Q4_K), 512 tokens: ideal int8 tensor time 0.43 ms (60 TMAC/s).
+
+| variant | ms |
+|---|---:|
+| full kernel | 1.40 |
+| float epilogue reduced to one add per output (DIAG 1) | 0.97 |
+| no min term (DIAG 2) | 1.21 |
+| no mma and minimal epilogue: copies, syncs, fragment loads only (DIAG 4) | 0.79 |
+| no global -> shared copies, compute only (DIAG 5) | 1.13 |
+
+So global memory is hidden (DIAG 5 is close to the full kernel). The per-sub-block float epilogue is ~30%, and the
+"plumbing" (syncs, scale decode, shared-memory fragment loads) alone is over half. Q6_K is ~2x slower than Q4_K
+per MAC (4.6-11 TMAC/s against 10-18): its scales cover 16 weights, so every `m16n8k16` mma (half the MACs of the
+Q4_K `k32` one) carries the same 4-output float fixup.
+
+What I tried, and what came of it:
+- **Issuing all independent mmas of a step before their epilogues:** 1-4%, within noise. ptxas already schedules
+  them well. Dropped.
+- **128-bit loads for the scale factors.** My count was 160 of Q4_K's 240 shared loads per warp and stage being
+  scalar broadcasts of scales. For Q4_K this was a regression: 1.40 -> 1.46 ms, because splitting the activation
+  scales into 8-byte copies doubled the `cp.async` count, and the compiler had probably already merged the other
+  loads. Reverted for Q4_K. Kept for Q6_K: weight scales stored `[row][lg][q]`, activation scales read as `float4`,
+  and Q6_K no longer copies the unused `xsd`. Together with replacing `__vsub4`, this gave 5-17% in the kernel bench
+  (noisy) and was within noise in the model.
+- **`q - 32` per byte without `__vsub4`.** sm_89 has no SIMD byte-subtract instruction, so `__vsub4` is emulated.
+  `(q + 0x60606060) ^ 0x80808080` is exact for q in [0, 63]: adding 0x60 cannot carry into the next byte, and
+  flipping bit 7 subtracts 128 mod 256.
+- Not tried, with reasons:
+  - Combining the two 16-groups of a Q6_K 32-block in integer arithmetic before converting to float. The sum can
+    reach 2^24, beyond the exact 2-op int -> float trick (|v| < 2^22), and I2F runs at a quarter of the FMA rate.
+  - fp16 mma for Q6_K. On GeForce Ada, fp16 with fp32 accumulate runs at a quarter of the int8 rate, so its ceiling
+    (~15 TMAC/s) is barely above today's 11.
+
+### Split-K for short chunks
+
+The same kernel ran ffn_down (4096 rows) at 10 TMAC/s and ffn_gate (12288 rows) at 14.4 for 64 tokens. One block
+(128 rows x up to 128 tokens) runs per SM, and a 4096-row matrix gives 32 blocks for chunks of up to 128 tokens.
+On 24 SMs that is 1.33 waves, so the second wave runs on 8 SMs and leaves 16 idle.
+
+Split-K: `blockIdx.z` takes 1/z of K and writes partial sums to a scratch plane, and `k_splitk_sum` adds the z
+planes in a fixed order, so results stay deterministic. `splitk_choose` models time as ceil(z * blocks / slots) / z
+and picks the best z (2-4, dividing K's super-blocks, at least 1024 K per split). It splits only when the model
+predicts at least 20% less time. Without that margin, the model's small predicted gains turned into measured
+losses (the reduction pass and the shorter K loops cost something), for example on the 8192-row qkv at 64 tokens.
+
+| matrix, tokens | no split | split-K | z |
+|---|---:|---:|---:|
+| ffn_down Q4_K, 64 / 128 | 0.298 / 0.498 ms | 0.234 / 0.340 ms | 3 |
+| ffn_down Q6_K, 64 / 128 | 0.580 / 0.811 ms | 0.406 / 0.566 ms | 3 |
+| ssm_out Q4_K (4096 x 4096), 64 / 128 | 0.100 / 0.165 ms | 0.083 / 0.136 ms | 2 |
+
+In the model, a 64-token chunk takes 57.5 -> 49.0 ms and a 128-token chunk 83.5 -> 74.4 ms. Chunks of 256 or more
+are unchanged, as designed.
+
+Side effect: a split changes the float summation order, so a token's activations now depend slightly on the length
+of the chunk it was processed in. Before, a column's GEMM result was independent of T. The output is still
+deterministic for a given prompt and chunking. `set_splitk(1)` / `AK_Q35_SPLITK=1` turn split-K off.
+
+### Snapshots inside a chunk
+
+`benchmarks/chunk_profile.py` replays an agent session on a frozen corpus (`benchmarks/data/agent_source.txt`,
+so turn sizes stay fixed as the source changes). A 148-token follow-up took 177 ms, while a 128-token chunk takes
+75 ms and a 256-token one 150 ms. The extra time came from how the prefix cache took its snapshots:
+- `snap_points` asks for the recurrent state at up to three `<|im_start|>` positions per request, the last being the
+  generation prompt.
+- `generate_spec_ex` ended a prefill segment at each of them and called `snap_copy`.
+- So every turn ended in a separate pass for the 3-5 tokens of `<|im_start|>assistant\n`.
+
+Any pass streams all 4.9 GB of weights (~22 ms), however few tokens it has. Segment tails of <= 24 tokens also fell
+back to GEMV passes of 12 tokens at ~22 ms each.
+
+Now the snapshot is taken inside the pass that covers it:
+- `SnapReq` lists up to 4 columns plus slot pointers.
+- `k_conv` and `k_gdn` hold the state rows in registers while they walk the chunk's columns. When they pass a
+  requested column, they also store that state into the slot, at its per-layer offset in `snap_copy`'s layout.
+- `prefill` processes the whole new range in one call, and chunks are balanced: rem -> ceil(rem / pf_cols) equal
+  chunks, so no short remainder is left for the GEMV path.
+- GEMV passes that take a snapshot run eagerly, since a CUDA graph would bake in the request.
+- The snapshot path is a template flag (`k_gdn<true>`). The first version checked `sr.n` inside `k_gdn`'s inner
+  loop and made that kernel 9% slower on every pass (43.9 -> 48.0 ms per 512-token chunk). Interleaved A/B runs
+  caught it.
+
+Correctness:
+- `test_snapshot_inside_chunk` takes a snapshot at column 699 of a 1000-token chunk and checks that it is
+  bit-identical to the state after a prefill of exactly 700 tokens. It runs with split-K off, because otherwise the
+  two chunk lengths use different splits and the recurrence amplifies 1e-7 rounding differences to ~0.2 over 700
+  tokens. That is legitimate rounding, not a bug: GEMV vs batched prefill differ by 0.35 the same way.
+- A token-level check was not enough. With the snapshot column off by one, the 24 greedy tokens after restoring
+  still matched, so the first version of the test passed a wrong implementation. The state comparison fails it.
+- The test also checks that greedy tokens after restoring the snapshot equal a fresh run.
+- New API for this: `ak_q35_cache_save`, `ak_q35_cache_read` (`save_state`, `cache_state`) and `ak_q35_set_splitk`.
+
+### Results (agent session replay, ctx 40960, 512-token chunks, interleaved A/B against `main`)
+
+| turn (new tokens) | before | after | |
+|---|---:|---:|---:|
+| first, 5968 | 3.84 s | 3.87 s | within noise |
+| follow-up, 148 | 0.177 s | **0.148 s** | -17% |
+| follow-up, 375 | 0.268 s | **0.245 s** | -9% |
+| follow-up, 748 | 0.530 s | **0.494 s** | -7% |
+| follow-up, 1446 | 1.028 s | 1.017 s | -1% |
+
+Raw: `experiments/results/turns_main_{0,1}.json` (before, two interleaved rounds) and `turns_splitk_snap.json` (after).
+
+Also in this round, the attention-vs-scalar test read its prompt from the live `qwen35_model.cu`, so editing that
+file's header moved a correlation from just above to just below the 0.9995 threshold. v1 and v2 gave identical logits
+either way, so the prompt changed, not the kernels. Its prompt now comes from a frozen copy
+(`tests/data/long_prompt_source.txt`).
+
 ## Next
 
-- **Matrix products are the largest prefill cost again** (57% of a 512-token chunk at 32k, 77% at 0). The int8 GEMM
-  is latency-bound: ~0.45 ms per token against an instruction-issue estimate of ~0.16. Options:
-  - a 256-row block of 16 warps, for more reuse per loaded activation tile (Q4_K fits in shared memory; Q6_K needs a
-    single stage);
-  - `ldmatrix` for the activation fragments, the same lesson as attention v2;
-  - moving the Q4_K min term out of the inner loop. Doing that exactly takes the same number of FMAs elsewhere (a
-    rows x T x K/32 product), so it only pays off on tensor cores in fp16, at some accuracy cost against the decode
-    path. Try it last.
-- Attention v2 is now ~20 TFLOPS. The remaining options are fp16 accumulation for S (rejected above on accuracy) or
-  a split-Q layout with 64-key tiles. Not worth it until GEMMs shrink.
+- **int8 GEMM plumbing** (over half of `k_mmq4`'s time per the DIAG runs): each stage has two `__syncthreads` around
+  a cooperative scale-decode phase that the tensor cores sit out. Decoding the scales for stage t+1 during stage t,
+  or per thread in registers, would remove one barrier per stage.
+- **Gated DeltaNet recurrence**: 43 ms of a 512-token chunk (15%) and ~20% of short chunks, the next largest item.
+  A chunked (WY / UT-transform) formulation would move most of it onto tensor cores.
+- **The GEMV / GEMM threshold** (`kPfMin` = 24): a whole new range of 13-24 tokens still takes two GEMV passes
+  (~44 ms). If a 24-token GEMM chunk is cheaper (likely, since its fixed cost is the ~22 ms weight read), lower it.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

@@ -1,0 +1,296 @@
+// Qwen3.5 ("qwen35" GGUF architecture) hybrid decoder: Gated DeltaNet linear attention in three of every four
+// layers, gated full attention in the fourth, plus the file's MTP (multi-token prediction) head used as a built-in
+// speculative draft model. Runs straight from a llama.cpp GGUF file.
+//
+// Matrices stay in their file format (Q4_K, Q6_K, Q8_0) and go through int8-activation dp4a GEMVs (qgemv.cuh).
+// Everything between the GEMVs is here:
+//
+//   linear-attention layer   x -> RMSNorm -> [qkv | z] GEMV, [alpha | beta] GEMV
+//                            -> causal conv1d (kernel 4, rolling state) + SiLU over the qkv channels
+//                            -> per value head: L2-norm q, k; S = exp(g) S; d = beta (v - S^T k); S += k d^T;
+//                               o = S^T q / sqrt(128)   (state 128 x 128 fp32 per head)
+//                            -> RMSNorm(o) * w * SiLU(z) -> out GEMV
+//   full-attention layer     x -> RMSNorm -> [q | gate] (per head), k, v GEMVs -> q/k RMSNorm, NeoX RoPE on the
+//                            first 64 of 256 dims -> split-key GQA attention over an fp16 cache
+//                            -> * sigmoid(gate) -> out GEMV
+//   every layer              residual, post-attention RMSNorm, SwiGLU FFN, residual
+//
+// Every kernel takes T token columns at consecutive positions. Decode and speculative verify (T <= kMaxCols) feed
+// int8 (Q8_1) activations to dp4a GEMVs; qgemv_dp4a_rows_mc keeps each column's summation order, so a column's
+// result is the single-column result. Long prompts go through the same kernels in chunks of up to kPfCols tokens
+// with fp16 activations and cuBLAS GEMMs against weights expanded to fp16 once per chunk.
+//
+// Recurrent state rollback: a decode / verify pass never writes the state of its own columns. It saves their inputs
+// (raw conv inputs; normalized k, v, decay, beta) into one of two buffers, and the next pass first replays the
+// ctl.commit accepted columns from the other buffer, with the same arithmetic, before running its own. Accepting n
+// of T verified tokens is just commit = n. Prefill passes (write mode) run all their columns into the state.
+//
+// MTP head (blk.N, one full-attention block): input pair (h_p, token_{p+1}) at MTP position p + 1, where h_p is
+// the target's final-normed hidden at p. e = RMSNorm(embed(token)), h = RMSNorm(h_p); x = eh_proj [e | h]; one
+// attention block + FFN with its own KV cache; RMSNorm (shared_head_norm) -> LM head -> draft token. Further drafts
+// chain through the MTP's own normed output, as llama.cpp does.
+//
+// The token embedding table lives in pinned host memory (one row per token over PCIe).
+
+#include "dequant.cuh"
+#include "qgemm.cuh"
+#include "error.h"
+#include "launch.h"
+#include "ops.cuh"
+
+#include <adakernel/api.h>
+
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace {
+
+enum { kF32 = 0, kQ8 = 8, kQ4K = 12, kQ6K = 14 };
+
+constexpr int kDk = 128;         // linear-attention head size (key and value)
+constexpr int kHd = 256;         // full-attention head size
+constexpr int kAttnChunk = 256;  // keys per split-attention block
+constexpr int kMaxCols = 12;     // widest decode / verify pass: 1 + 11 drafts
+constexpr int kSub = 8;          // delta-rule columns staged in shared memory at a time
+constexpr int kPfCols = 1024;    // default prefill chunk (AK_Q35_PF_COLS overrides); 512 -> 1024 cut TTFT 14-22% on coding prompts
+constexpr int kPfMin = 24;       // shorter remainders go through the GEMV path
+
+// ------------------------------------------------------------------------------------------------
+// GGUF header
+// ------------------------------------------------------------------------------------------------
+
+struct Tensor {
+    std::vector<uint64_t> dims;
+    uint32_t type = 0;
+    uint64_t offset = 0;  // in the file's data section
+};
+
+struct File {
+    std::map<std::string, double> num;
+    std::map<std::string, std::string> str;
+    std::map<std::string, Tensor> tensors;
+    uint64_t data_offset = 0;
+};
+
+struct Rd {
+    std::ifstream in;
+    template <class T>
+    T get() {
+        T v{};
+        in.read(reinterpret_cast<char*>(&v), sizeof(T));
+        return v;
+    }
+    std::string s() {
+        const uint64_t n = get<uint64_t>();
+        if (n > (1ull << 30)) {
+            in.setstate(std::ios::failbit);
+            return {};
+        }
+        std::string r(static_cast<size_t>(n), '\0');
+        if (n) in.read(r.data(), static_cast<std::streamsize>(n));
+        return r;
+    }
+    // Scalars come back as double, strings via *str; arrays are skipped.
+    int value(uint32_t t, double* d, std::string* str) {
+        switch (t) {
+            case 0: *d = get<uint8_t>(); return 1;
+            case 1: *d = get<int8_t>(); return 1;
+            case 2: *d = get<uint16_t>(); return 1;
+            case 3: *d = get<int16_t>(); return 1;
+            case 4: *d = get<uint32_t>(); return 1;
+            case 5: *d = get<int32_t>(); return 1;
+            case 6: *d = get<float>(); return 1;
+            case 7: *d = get<uint8_t>(); return 1;
+            case 8: *str = s(); return 2;
+            case 9: {
+                const uint32_t et = get<uint32_t>();
+                const uint64_t n = get<uint64_t>();
+                double dd;
+                std::string ss;
+                for (uint64_t i = 0; i < n && in; ++i) value(et, &dd, &ss);
+                return 0;
+            }
+            case 10: *d = static_cast<double>(get<uint64_t>()); return 1;
+            case 11: *d = static_cast<double>(get<int64_t>()); return 1;
+            case 12: *d = get<double>(); return 1;
+            default: in.setstate(std::ios::failbit); return 0;
+        }
+    }
+};
+
+ak_status parse(const char* path, File* f) {
+    Rd r;
+    r.in.open(path, std::ios::binary);
+    if (!r.in) {
+        ak_set_error("qwen35: cannot open file");
+        return AK_ERR_INVALID;
+    }
+    if (r.get<uint32_t>() != 0x46554747u || r.get<uint32_t>() < 2) {
+        ak_set_error("qwen35: not a GGUF v2+ file");
+        return AK_ERR_INVALID;
+    }
+    const uint64_t n_tensors = r.get<uint64_t>();
+    const uint64_t n_kv = r.get<uint64_t>();
+    for (uint64_t i = 0; i < n_kv && r.in; ++i) {
+        const std::string key = r.s();
+        double d = 0;
+        std::string s;
+        const int kind = r.value(r.get<uint32_t>(), &d, &s);
+        if (kind == 1) f->num[key] = d;
+        if (kind == 2) f->str[key] = s;
+    }
+    for (uint64_t i = 0; i < n_tensors && r.in; ++i) {
+        const std::string name = r.s();
+        Tensor t;
+        const uint32_t nd = r.get<uint32_t>();
+        if (nd > 4) {
+            ak_set_error("qwen35: tensor with more than 4 dims");
+            return AK_ERR_INVALID;
+        }
+        for (uint32_t k = 0; k < nd; ++k) t.dims.push_back(r.get<uint64_t>());
+        t.type = r.get<uint32_t>();
+        t.offset = r.get<uint64_t>();
+        f->tensors[name] = t;
+    }
+    if (!r.in) {
+        ak_set_error("qwen35: truncated header");
+        return AK_ERR_INVALID;
+    }
+    uint64_t align = 32;
+    auto it = f->num.find("general.alignment");
+    if (it != f->num.end() && it->second > 0) align = static_cast<uint64_t>(it->second);
+    const uint64_t end = static_cast<uint64_t>(r.in.tellg());
+    f->data_offset = (end + align - 1) / align * align;
+    return AK_OK;
+}
+
+size_t tensor_bytes(const Tensor& t) {
+    size_t n = 1;
+    for (uint64_t d : t.dims) n *= d;
+    switch (t.type) {
+        case kF32: return n * 4;
+        case kQ8: return n / 32 * 34;
+        case kQ4K: return n / 256 * 144;
+        case kQ6K: return n / 256 * 210;
+        default: return 0;
+    }
+}
+
+int qcode(uint32_t t) { return t == kQ8 ? 0 : (t == kQ4K ? 1 : (t == kQ6K ? 2 : -1)); }
+
+struct QMat {
+    const uint8_t* w = nullptr;
+    int type = -1;  // 0 Q8_0, 1 Q4_K, 2 Q6_K
+    int rows = 0;
+    int K = 0;
+    size_t bytes() const {
+        const int nb = type == 0 ? K / 32 : K / 256;
+        const int bb = type == 0 ? 34 : (type == 1 ? 144 : 210);
+        return static_cast<size_t>(nb) * bb * rows;
+    }
+};
+
+struct Layer {
+    bool linear = true;
+    const float* attn_norm = nullptr;
+    const float* post_norm = nullptr;
+    // linear attention
+    QMat wqkv, wz, walpha, wbeta, wout;
+    const float* conv_w = nullptr;  // [channels][4]
+    const float* dt_bias = nullptr;
+    const float* ssm_a = nullptr;   // -exp(A_log)
+    const float* ssm_norm = nullptr;
+    float* conv_state = nullptr;    // [3][channels], oldest first
+    float* gdn_state = nullptr;     // [Hv][Dv][Dk]
+    float* conv_save = nullptr;     // [2][kMaxCols][channels]   raw conv inputs of the last pass
+    float* k_save = nullptr;        // [2][kMaxCols][Hv][Dk]     normalized keys (per value head)
+    float* v_save = nullptr;        // [2][kMaxCols][Hv][Dv]
+    float* db_save = nullptr;       // [2][kMaxCols][2 Hv]       decay | beta
+    // full attention
+    QMat wq, wk, wv, wo;
+    const float* q_norm = nullptr;
+    const float* k_norm = nullptr;
+    __half* kc = nullptr;  // [max_seq][Hkv][hd]
+    __half* vc = nullptr;
+    // FFN
+    QMat wgate, wup, wdown;
+};
+
+struct Mtp {
+    bool present = false;
+    Layer blk;
+    QMat eh_proj;  // [d rows][2d]
+    const float* enorm = nullptr;
+    const float* hnorm = nullptr;
+    const float* head_norm = nullptr;
+};
+
+ak_status ck(cudaError_t e) {
+    if (e != cudaSuccess) {
+        ak_set_error(cudaGetErrorString(e));
+        return e == cudaErrorMemoryAllocation ? AK_ERR_OOM : AK_ERR_CUDA;
+    }
+    return AK_OK;
+}
+
+// Profile buckets (ak_q35_profile).
+enum Kind {
+    kKEmbed, kKNorm, kKGemvQkv, kKGemvAb, kKConv, kKGdn, kKGatedNorm, kKGemvOut, kKGemvAttnIn, kKAttnPrep,
+    kKAttnPart, kKAttnCombine, kKGemvAttnOut, kKGemvGateUp, kKSilu, kKGemvDown, kKGemvLogits, kKArgmax, kKCount
+};
+
+// Device control block: target position of column 0, saved columns to replay first, save buffer the previous pass
+// wrote (this pass writes the other), MTP position of column 0.
+enum { kCtlPos = 0, kCtlCommit = 1, kCtlPar = 2, kCtlMpos = 3, kCtlN = 4 };
+
+// Activation buffers for one pass width. Decode buffers (cols = kMaxCols) use Q8_1 activations; prefill buffers
+// (cols = pf_cols) use fp16 activations in a16, whose column stride is the consuming matrix's K.
+struct Bufs {
+    int cols = 0;
+    bool pf = false;
+    float *x = nullptr, *proj = nullptr, *ebuf = nullptr, *hbuf = nullptr, *mh = nullptr;
+    float *big = nullptr, *ab = nullptr, *conv_out = nullptr, *o = nullptr, *q = nullptr, *v = nullptr, *gu = nullptr;
+    int8_t *hq_q = nullptr, *aq = nullptr, *fq = nullptr;
+    float *hq_d = nullptr, *ad = nullptr, *fd = nullptr;
+    __half* a16 = nullptr;
+    int* tok = nullptr;
+    int* mtok = nullptr;
+};
+
+}  // namespace
+
+struct ak_q35_model {
+    ak_q35_info info{};
+    int n_layers = 0, d = 0, ff = 0, vocab = 0, max_seq = 0;
+    int hq = 0, hkv = 0, n_rot = 0;
+    int hk = 0, hv = 0, conv_ch = 0, d_inner = 0;
+    int big_n = 0;  // per-column stride of `big`
+    int aq_n = 0;   // per-column stride of `aq`
+    float eps = 1e-6f, theta = 1e7f;
+    uint8_t* blob = nullptr;
+    uint8_t* embd_host = nullptr;  // pinned, mapped
+    const uint8_t* embd_dev = nullptr;
+    int embd_type = 1;
+    std::vector<Layer> layers;
+    Mtp mtp;
+    QMat out;
+    const float* out_norm = nullptr;
+    Bufs dec;                            // decode / verify, kMaxCols columns
+    Bufs pf;                             // prefill, pf_cols columns, allocated on the first long prompt
+    int pf_cols = kPfCols;
+    bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
+    bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
+    int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused qua

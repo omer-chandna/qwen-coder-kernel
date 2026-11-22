@@ -443,6 +443,15 @@ AK_API ak_status ak_q35_generate_spec_ex(ak_q35_model* model, const int32_t* pro
                                          int32_t* n_out);
 /* Restore the recurrent state saved in a slot. The caller must know the KV caches still hold that prefix. */
 AK_API ak_status ak_q35_cache_load(ak_q35_model* model, int slot);
+/* Most K splits an int8 prefill GEMM may use when a launch would fill few waves (default 4, also AK_Q35_SPLITK;
+   1 = never split). A split changes the float summation order, so a token's activations then depend slightly on
+   the chunk length it was processed in. */
+AK_API ak_status ak_q35_set_splitk(ak_q35_model* model, int max_split);
+/* Save the current recurrent state into a slot. */
+AK_API ak_status ak_q35_cache_save(ak_q35_model* model, int slot);
+/* Copy up to n floats of a slot's saved recurrent state to out (host); *n_total gets the slot size in floats.
+   out = NULL / n = 0: only report the size. For tests and debugging. */
+AK_API ak_status ak_q35_cache_read(ak_q35_model* model, int slot, float* out, size_t n, size_t* n_total);
 /* Prompt processing path: 1 (default) batched fp16 GEMM chunks for long prompts, 0 GEMV chunks of max_cols tokens. */
 AK_API ak_status ak_q35_set_prefill(ak_q35_model* model, int batched);
 /* Attention kernels: 2 (default) tensor-core tiled v2 (ldmatrix + cp.async), 1 tensor-core v1, 0 the older

@@ -669,9 +669,13 @@ __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commi
 template <int N>
 __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
 
-template <int BN, int S, int MB = 1>
+// DIAG (benchmarks/gemm_bench.cu only; the runtime uses 0), all timing only with wrong results:
+//   1 = the per-sub-block float epilogue reduced to one add per output, 2 = no min term,
+//   4 = no mma either (loads, syncs and fragment reads only), 5 = no global -> shared copies (compute only).
+template <int BN, int S, int MB = 1, int DIAG = 0>
 __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t* xq, const float* xd,
-                                               const float* xsd, float* Y, int rows, int K, int T, int ldy) {
+                                               const float* xsd, float* Y, int rows, int K, int T, int ldy,
+                                               int nsplit) {
     constexpr int TW = BN / 2;   // tokens per warp
     constexpr int NTW = TW / 8;
     constexpr size_t SB = p4_stage_bytes<BN>();
@@ -688,13 +692,18 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
     const int r0 = blockIdx.y * BM;
     const int KB = K / 32;
     const size_t row_bytes = static_cast<size_t>(K / 256) * 144;
-    const int nk = K / P4_BK;
+    // Split-K: block z covers stages [kt0, kt0 + nk) and writes its partial sums to plane z of Y (k_splitk_sum
+    // adds the planes in a fixed order, so results are deterministic).
+    const int nk = K / P4_BK / nsplit;
+    const int kt0 = static_cast<int>(blockIdx.z) * nk;
+    Y += static_cast<size_t>(blockIdx.z) * T * ldy;
 
     auto wraw = [&](int st) { return p4_smem + st * SB; };
     auto xsm = [&](int st) { return reinterpret_cast<int8_t*>(p4_smem + st * SB + BM * P4_WS); };
     auto xsc = [&](int st) { return reinterpret_cast<float*>(p4_smem + st * SB + BM * P4_WS + BN * P4_XS); };
 
     auto issue = [&](int kt) {
+        if constexpr (DIAG == 5) return;
         const int st = kt % S;
         const int k0 = kt * P4_BK;
         const int b = k0 >> 8;
@@ -712,7 +721,7 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
             const bool ok = c0 + n < T;
             cp_async16(xs + n * P4_XS + ch * 16, xq + (ok ? static_cast<size_t>(c0 + n) * K : 0) + k0 + ch * 16, ok);
         }
-        float* sc = xsc(st);
+        float* sc = xsc(st);  // per token: [xd of the stage's four 32-blocks | xsd of them]
         for (int i = tid; i < BN * 2; i += NT) {
             const int n = i >> 1, which = i & 1;
             const bool ok = c0 + n < T;
@@ -729,10 +738,10 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
 
 #pragma unroll
     for (int s = 0; s < S - 1; ++s) {
-        if (s < nk) issue(s);
+        if (s < nk) issue(kt0 + s);
         cp_async_commit();
     }
-    for (int kt = 0; kt < nk; ++kt) {
+    for (int kt = kt0; kt < kt0 + nk; ++kt) {
         cp_async_wait<S - 2>();
         __syncthreads();  // stage kt landed for every thread; stage kt - 1 and wsc are free
         const int st = kt % S;
@@ -753,12 +762,12 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
                     sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
                     mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
                 }
-                wsc[r * 8 + sb] = dm.x * static_cast<float>(sc);
-                wsc[r * 8 + 4 + sb] = dm.y * static_cast<float>(mn);
+                wsc[r * 8 + (sb >> 1) * 4 + (sb & 1)] = dm.x * static_cast<float>(sc);  // [jj][a lo, a hi, b lo, b hi]
+                wsc[r * 8 + (sb >> 1) * 4 + 2 + (sb & 1)] = dm.y * static_cast<float>(mn);
             }
         }
         __syncthreads();
-        if (kt + S - 1 < nk) issue(kt + S - 1);
+        if (kt + S - 1 < kt0 + nk) issue(kt + S - 1);
         cp_async_commit();
 
         const uint8_t* ws = wraw(st);
@@ -783,11 +792,11 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
                 }
 #pragma unroll
                 for (int e = 0; e < 2; ++e) {
-                    const int rr = r + 8 * e;
-                    ra[mt][e][0] = wsc[rr * 8 + 2 * jj];
-                    ra[mt][e][1] = wsc[rr * 8 + 2 * jj + 1];
-                    rb[mt][e][0] = wsc[rr * 8 + 4 + 2 * jj];
-                    rb[mt][e][1] = wsc[rr * 8 + 4 + 2 * jj + 1];
+                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + (r + 8 * e) * 8 + jj * 4);
+                    ra[mt][e][0] = w4.x;
+                    ra[mt][e][1] = w4.y;
+                    rb[mt][e][0] = w4.z;
+                    rb[mt][e][1] = w4.w;
                 }
             }
 #pragma unroll
@@ -805,8 +814,26 @@ __global__ void __launch_bounds__(NT, MB) k_mmq4(const uint8_t* W, const int8_t*
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         int c[4] = {0, 0, 0, 0};
-                        mma_s8_k32(c, nb ? ahi[mt] : alo[mt], nb ? bhi : blo);
+                        if constexpr (DIAG == 4) {  // no mma: operands folded in so their loads stay
+                            c[0] = static_cast<int>((nb ? ahi[mt][0] : alo[mt][0]) ^ (nb ? bhi[0] : blo[0]));
+                            c[1] = static_cast<int>((nb ? ahi[mt][1] : alo[mt][1]) ^ (nb ? bhi[1] : blo[1]));
+                            c[2] = static_cast<int>((nb ? ahi[mt][2] : alo[mt][2]));
+                            c[3] = static_cast<int>((nb ? ahi[mt][3] : alo[mt][3]));
+                        } else {
+                            mma_s8_k32(c, nb ? ahi[mt] : alo[mt], nb ? bhi : blo);
+                        }
                         float* o = acc[mt][nt];
+                        if constexpr (DIAG == 1 || DIAG == 4) {
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) o[e] += __int_as_float(c[e]);
+                            continue;
+                        } else if constexpr (DIAG == 2) {
+                            o[0] = fmaf(ra[mt][0][nb] * xd0, i2f_small(c[0]), o[0]);
+                            o[1] = fmaf(ra[mt][0][nb] * xd1, i2f_small(c[1]), o[1]);
+                            o[2] = fmaf(ra[mt][1][nb] * xd0, i2f_small(c[2]), o[2]);
+                            o[3] = fmaf(ra[mt][1][nb] * xd1, i2f_small(c[3]), o[3]);
+                            continue;
+                        }
                         o[0] = fmaf(ra[mt][0][nb] * xd0, i2f_small(c[0]), fmaf(-rb[mt][0][nb], xs0, o[0]));
                         o[1] = fmaf(ra[mt][0][nb] * xd1, i2f_small(c[1]), fmaf(-rb[mt][0][nb], xs1, o[1]));
                         o[2] = fmaf(ra[mt][1][nb] * xd0, i2f_small(c[2]), fmaf(-rb[mt][1][nb], xs0, o[2]));
@@ -859,9 +886,10 @@ __device__ __forceinline__ void cp_async4(void* smem, const void* gmem, bool val
     asm volatile("cp.async.ca.shared.global [%0], [%1], 4, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 4 : 0));
 }
 
-template <int BN, int S, int MB = 1>
+template <int BN, int S, int MB = 1, int DIAG = 0>  // DIAG: as k_mmq4 (1 = minimal epilogue, timing only)
 __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t* xq, const float* xd,
-                                               const float* xsd, float* Y, int rows, int K, int T, int ldy) {
+                                               const float* xsd, float* Y, int rows, int K, int T, int ldy,
+                                               int nsplit) {
     constexpr int TW = BN / 2;
     constexpr int NTW = TW / 8;
     constexpr size_t SB = p6_stage_bytes<BN>();
@@ -878,7 +906,11 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
     const int r0 = blockIdx.y * BM;
     const int KB = K / 32;
     const size_t row_bytes = static_cast<size_t>(K / 256) * 210;
-    const int nk = K / P4_BK;
+    // Split-K: block z covers stages [kt0, kt0 + nk) and writes its partial sums to plane z of Y (k_splitk_sum
+    // adds the planes in a fixed order, so results are deterministic).
+    const int nk = K / P4_BK / nsplit;
+    const int kt0 = static_cast<int>(blockIdx.z) * nk;
+    Y += static_cast<size_t>(blockIdx.z) * T * ldy;
 
     auto wraw = [&](int st) { return p6_smem + st * SB; };
     auto xsm = [&](int st) { return reinterpret_cast<int8_t*>(p6_smem + st * SB + BM * P6_WS); };
@@ -914,12 +946,10 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
             const bool ok = c0 + n < T;
             cp_async16(xs + n * P4_XS + ch * 16, xq + (ok ? static_cast<size_t>(c0 + n) * K : 0) + k0 + ch * 16, ok);
         }
-        float* sc = xsc(st);
-        for (int i = tid; i < BN * 2; i += NT) {
-            const int n = i >> 1, which = i & 1;
-            const bool ok = c0 + n < T;
-            const float* srcp = (which ? xsd : xd) + (ok ? static_cast<size_t>(c0 + n) * KB : 0) + k0 / 32;
-            cp_async16(sc + n * 8 + which * 4, srcp, ok);
+        float* sc = xsc(st);  // per token: xd of the stage's four 32-blocks (Q6_K has no min term: no xsd)
+        for (int i = tid; i < BN; i += NT) {
+            const bool ok = c0 + i < T;
+            cp_async16(sc + i * 8, xd + (ok ? static_cast<size_t>(c0 + i) * KB : 0) + k0 / 32, ok);
         }
     };
 
@@ -931,10 +961,10 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
 
 #pragma unroll
     for (int s = 0; s < S - 1; ++s) {
-        if (s < nk) issue(s);
+        if (s < nk) issue(kt0 + s);
         cp_async_commit();
     }
-    for (int kt = 0; kt < nk; ++kt) {
+    for (int kt = kt0; kt < kt0 + nk; ++kt) {
         cp_async_wait<S - 2>();
         __syncthreads();
         const int st = kt % S;
@@ -945,10 +975,11 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
             const int r = i >> 3, g = i & 7;
             const uint8_t* s3 = ws + r * P6_WS + 104 + sh;  // logical byte 192
             const float d = __half2float(*reinterpret_cast<const __half*>(s3 + 16));
-            wsc[r * 8 + g] = d * static_cast<float>(static_cast<int8_t>(s3[h * 8 + g]));
+            // 16-group g = 2 q + lg -> [lg][q], so one 128-bit load gives a row's four scales for one lg
+            wsc[r * 8 + (g & 1) * 4 + (g >> 1)] = d * static_cast<float>(static_cast<int8_t>(s3[h * 8 + g]));
         }
         __syncthreads();
-        if (kt + S - 1 < nk) issue(kt + S - 1);
+        if (kt + S - 1 < kt0 + nk) issue(kt + S - 1);
         cp_async_commit();
 
         const int8_t* xs = xsm(st);
@@ -970,28 +1001,39 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
                     const uint8_t* rowp = ws + r * P6_WS;
                     const int l = lg * 16 + tig * 4;
                     const uint32_t qa = word(rowp + l), qb = word(rowp + 32 + l), qc = word(rowp + 68 + l);
-                    a[mt][0][e] = __vsub4((qa & 0x0F0F0F0Fu) | ((qc << 4) & 0x30303030u), 0x20202020u);
-                    a[mt][1][e] = __vsub4((qb & 0x0F0F0F0Fu) | ((qc << 2) & 0x30303030u), 0x20202020u);
-                    a[mt][2][e] = __vsub4(((qa >> 4) & 0x0F0F0F0Fu) | (qc & 0x30303030u), 0x20202020u);
-                    a[mt][3][e] = __vsub4(((qb >> 4) & 0x0F0F0F0Fu) | ((qc >> 2) & 0x30303030u), 0x20202020u);
-#pragma unroll
-                    for (int q = 0; q < 4; ++q) rs[mt][e][q] = wsc[r * 8 + q * 2 + lg];
+                    // q - 32 per byte for q in [0, 63]: q + 0x60 cannot carry into the next byte, and flipping bit 7
+                    // subtracts 128 mod 256 (2 ops; __vsub4 has no native instruction on sm_89 and is emulated)
+                    a[mt][0][e] = (((qa & 0x0F0F0F0Fu) | ((qc << 4) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
+                    a[mt][1][e] = (((qb & 0x0F0F0F0Fu) | ((qc << 2) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
+                    a[mt][2][e] = ((((qa >> 4) & 0x0F0F0F0Fu) | (qc & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
+                    a[mt][3][e] = ((((qb >> 4) & 0x0F0F0F0Fu) | ((qc >> 2) & 0x30303030u)) + 0x60606060u) ^ 0x80808080u;
+                    const float4 w4 = *reinterpret_cast<const float4*>(wsc + r * 8 + lg * 4);
+                    rs[mt][e][0] = w4.x;
+                    rs[mt][e][1] = w4.y;
+                    rs[mt][e][2] = w4.z;
+                    rs[mt][e][3] = w4.w;
                 }
             }
 #pragma unroll
             for (int nt = 0; nt < NTW; ++nt) {
                 const int n = wn * TW + nt * 8;
-                const float* x0 = xc + (n + tig * 2) * 8;
-                const float* x1 = x0 + 8;
+                const float4 X0 = *reinterpret_cast<const float4*>(xc + (n + tig * 2) * 8);
+                const float4 X1 = *reinterpret_cast<const float4*>(xc + (n + tig * 2 + 1) * 8);
+                const float xa[4] = {X0.x, X0.y, X0.z, X0.w}, xb[4] = {X1.x, X1.y, X1.z, X1.w};
 #pragma unroll
                 for (int q = 0; q < 4; ++q) {  // quarter: k = 32 q + l
                     const uint32_t bq = ldq32(xs + (n + gq) * P4_XS + q * 32 + lg * 16 + tig * 4);
-                    const float xd0 = x0[q], xd1 = x1[q];
+                    const float xd0 = xa[q], xd1 = xb[q];
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         int c[4] = {0, 0, 0, 0};
                         mma_s8_k16(c, a[mt][q], bq);
                         float* o = acc[mt][nt];
+                        if constexpr (DIAG == 1) {
+#pragma unroll
+                            for (int e = 0; e < 4; ++e) o[e] += __int_as_float(c[e]);
+                            continue;
+                        }
                         o[0] = fmaf(rs[mt][0][q] * xd0, i2f_small(c[0]), o[0]);
                         o[1] = fmaf(rs[mt][0][q] * xd1, i2f_small(c[1]), o[1]);
                         o[2] = fmaf(rs[mt][1][q] * xd0, i2f_small(c[2]), o[2]);
@@ -1017,6 +1059,18 @@ __global__ void __launch_bounds__(NT, MB) k_mmq6(const uint8_t* W, const int8_t*
             }
         }
     }
+}
+
+// Split-K reduction: Y[c * ldy + r] = sum over z = 0 .. nsplit - 1 of part[z][c][r] (planes of T x rows), in order.
+__global__ void k_splitk_sum(const float* part, int nsplit, int rows, int T, float* Y, int ldy) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    const int c = blockIdx.y;
+    if (r >= rows) return;
+    const size_t plane = static_cast<size_t>(T) * rows;
+    const float* p = part + static_cast<size_t>(c) * rows + r;
+    float v = p[0];
+    for (int z = 1; z < nsplit; ++z) v += p[z * plane];
+    Y[static_cast<size_t>(c) * ldy + r] = v;
 }
 
 }  // namespace qgemm

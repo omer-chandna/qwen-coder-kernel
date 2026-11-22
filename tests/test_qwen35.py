@@ -135,6 +135,35 @@ def test_prefix_cache_equals_fresh(model):
         model.generate_cached(ids, 1, snap_at=fmt.snap_points(ids))
 
 
+def test_snapshot_inside_chunk(model):
+    """A snapshot requested in the middle of a batched prefill chunk is taken inside the conv / delta-rule kernels
+    (SnapReq); restoring it for a different continuation must give exactly the fresh greedy tokens."""
+    import numpy as np
+
+    ids = tokenize(MODEL, _long_prompt())
+    at = 700  # inside the first GEMM chunk of the 1000-token prompt below
+    # Split-K picks splits by chunk length, which changes float rounding; without it a token's activations do not
+    # depend on the chunk it is in, so the snapshot must equal the state after a prefill of exactly `at` tokens.
+    model.set_splitk(1)
+    try:
+        model.logits(ids[:at])
+        model.save_state(3)
+        ref_state = model.cache_state(3)
+        model.reset_cache()
+        first = model.generate_cached(ids[:1000], 4, snap_at=[at])
+        slot = next(i for i, s in enumerate(model._slots) if s is not None and s.size == at)
+        snap = model.cache_state(slot)
+    finally:
+        model.set_splitk(4)
+    assert first["cached_tokens"] == 0
+    assert np.array_equal(snap, ref_state), float(np.abs(snap - ref_state).max())
+    other = ids[:at] + tokenize(MODEL, " Summarize the code above in one sentence.")
+    got = model.generate_cached(other, 24)
+    assert got["cached_tokens"] == at
+    ref = model.generate(other, len(got["tokens"]))["tokens"]
+    assert (got["tokens"] == ref).all()
+
+
 def test_cached_stops_early(model):
 
     ids = tokenize(MODEL, "Count: 1, 2, 3,")
@@ -149,7 +178,9 @@ def test_cached_stops_early(model):
 
 
 def _long_prompt(n_chars: int = 4800) -> str:
-    src = (Path(__file__).resolve().parents[1] / "native" / "cuda" / "qwen35_model.cu").read_text(encoding="utf-8")
+    # A frozen copy of the start of qwen35_model.cu (commit 629018b): reading the live file made the prompt, and so
+    # the near-threshold correlations below, change whenever that file's header was edited.
+    src = (Path(__file__).resolve().parent / "data" / "long_prompt_source.txt").read_text(encoding="utf-8")
     return ("<|im_start|>user\nExplain what this file does.\n\n```cpp\n" + src[:n_chars]
             + "```<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 

@@ -68,6 +68,16 @@ constexpr int kSub = 8;          // delta-rule columns staged in shared memory a
 constexpr int kPfCols = 1024;    // default prefill chunk (AK_Q35_PF_COLS overrides); 512 -> 1024 cut TTFT 14-22% on coding prompts
 constexpr int kPfMin = 24;       // shorter remainders go through the GEMV path
 
+// Recurrent-state snapshots taken inside a pass: after column col[i], k_conv / k_gdn also store the state of each
+// linear layer into base[i] (a prefix-cache slot, laid out as snap_copy does: per linear layer [conv 3 x C | gdn]).
+// This lets a prompt be processed in one batched pass even when the prefix cache wants the state at positions in
+// the middle of it (docs/QWEN38_9B.md, "Snapshots inside a chunk").
+struct SnapReq {
+    float* base[AK_Q35_CACHE_SLOTS];
+    int col[AK_Q35_CACHE_SLOTS];
+    int n;
+};
+
 // ------------------------------------------------------------------------------------------------
 // GGUF header
 // ------------------------------------------------------------------------------------------------
@@ -302,6 +312,11 @@ struct ak_q35_model {
     float *xd8 = nullptr, *xsd8 = nullptr;  // their per-32 scales and scale * sum
     int int8_max = 1 << 30;              // longest chunk the int8 path takes (AK_Q35_INT8_MAX)
     int mmq_short = 0, mmq_long = 2;     // pipelined int8 GEMM configurations (mmq_dispatch)
+    float* splitk = nullptr;             // split-K partial sums of the int8 GEMMs [nsplit][T][rows]
+    size_t splitk_n = 0;                 // its size in floats
+    int splitk_max = 4;                  // most K splits per int8 GEMM (AK_Q35_SPLITK; 1 = off)
+    int n_sm = 0;                        // streaming multiprocessors on the device
+    SnapReq snapreq{};                   // snapshots the next target pass takes (n = 0: none)
     int qdiag = 0;                       // AK_Q35_QDIAG: 1 = the plain int8 kernel skips the math (timing only),
                                          // 2 = Q4_K uses the plain int8 kernel instead of the pipelined one
     int draft_vocab = 0;                 // rows of the LM head the MTP draft scores (a prefix of the vocab)
@@ -442,8 +457,11 @@ __global__ void __launch_bounds__(128, 8) k_gemv_mc(const uint8_t* W, const uint
 // state is [3][C], oldest first; w is [C][4] (ggml ssm_conv layout, w[ch][3] multiplies the newest input).
 // First replays ctl.commit saved inputs of the previous pass (buffer ctl.par). save_mode: the state is left after
 // the replay and this pass's inputs go to buffer par ^ 1; otherwise every column runs into the state.
+// SNAP: the pass takes recurrent-state snapshots (SnapReq). A template flag rather than a runtime check, because a
+// check in k_gdn's inner loop cost ~9% of that kernel on every pass (measured), and snapshot passes are rare.
+template <bool SNAP>
 __global__ void k_conv(const float* in, int in_stride, float* state, float* save, const int* ctl, const float* w,
-                       float* out, int C, int T, int save_mode) {
+                       float* out, int C, int T, int save_mode, SnapReq sr, size_t sr_off) {
     const int ch = blockIdx.x * blockDim.x + threadIdx.x;
     if (ch >= C) return;
     float s0 = state[ch], s1 = state[C + ch], s2 = state[2 * C + ch];
@@ -473,6 +491,13 @@ __global__ void k_conv(const float* in, int in_stride, float* state, float* save
         s0 = s1;
         s1 = s2;
         s2 = xn;
+        for (int i = 0; SNAP && i < sr.n; ++i) {
+            if (sr.col[i] != c) continue;
+            float* dst_s = sr.base[i] + sr_off;
+            dst_s[ch] = s0;
+            dst_s[C + ch] = s1;
+            dst_s[2 * C + ch] = s2;
+        }
     }
     if (!save_mode) {
         state[ch] = s0;
@@ -499,10 +524,11 @@ __device__ __forceinline__ void gdn_step(float4& mm, const float4 kk, float deca
 // head h for the whole pass (held in registers), lanes hold four consecutive key dims. Value head h reads key/query
 // head h % Hk (ggml layout). conv columns (C apart): [q Hk*128 | k Hk*128 | v Hv*128]; ab columns (2 Hv apart):
 // [alpha | beta]. Columns are staged kSub at a time. Replay / save as in k_conv.
+template <bool SNAP>  // as k_conv
 __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const float* ab, const float* dt_bias,
                                              const float* ssm_a, float* state, float* k_save, float* v_save,
                                              float* db_save, const int* ctl, float* out, int out_stride, int Hk,
-                                             int Hv, float eps, int T, int save_mode) {
+                                             int Hv, float eps, int T, int save_mode, SnapReq sr, size_t sr_off) {
     __shared__ __align__(16) float qs[kSub][kDk];
     __shared__ __align__(16) float ks[kSub][kDk];
     __shared__ float vs[kSub][16];
@@ -591,6 +617,11 @@ __global__ void __launch_bounds__(256) k_gdn(const float* conv, int C, const flo
                 gdn_step(mm[r], kk, sdecay[cc], sbeta[cc], vs[cc][warp * 2 + r]);
                 const float oj = xor_sum(mm[r].x * qq.x + mm[r].y * qq.y + mm[r].z * qq.z + mm[r].w * qq.w);
                 if (lane == 0) out[static_cast<size_t>(c0 + cc) * out_stride + h * kDk + j] = oj * scale;
+                for (int i = 0; SNAP && i < sr.n; ++i) {
+                    if (sr.col[i] != c0 + cc) continue;
+                    reinterpret_cast<float4*>(sr.base[i] + sr_off + (static_cast<size_t>(h) * kDk + j) * kDk)[lane] =
+                        mm[r];
+                }
             }
         }
     }
@@ -1517,9 +1548,9 @@ Act act_fq(const Bufs& b) { return b.pf ? Act{nullptr, nullptr, b.a16} : Act{b.f
 // shared-memory limit is raised on first use of each instantiation.
 template <int BN, int S, int MB>
 void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* xsd, float* y, int T, int ldy,
-                cudaStream_t s) {
+                int nsplit, cudaStream_t s) {
     using namespace akd::qgemm;
-    const dim3 g((T + BN - 1) / BN, (W.rows + BM - 1) / BM);
+    const dim3 g((T + BN - 1) / BN, (W.rows + BM - 1) / BM, nsplit);
     if (W.type == 1) {
         static bool init = false;
         if (!init) {
@@ -1527,7 +1558,7 @@ void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* x
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p4_smem_bytes<BN, S>()));
             init = true;
         }
-        k_mmq4<BN, S, MB><<<g, NT, p4_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy);
+        k_mmq4<BN, S, MB><<<g, NT, p4_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy, nsplit);
     } else {
         static bool init = false;
         if (!init) {
@@ -1535,7 +1566,7 @@ void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* x
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p6_smem_bytes<BN, S>()));
             init = true;
         }
-        k_mmq6<BN, S, MB><<<g, NT, p6_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy);
+        k_mmq6<BN, S, MB><<<g, NT, p6_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy, nsplit);
     }
 }
 
@@ -1545,10 +1576,36 @@ void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* x
 //   0: 49.1 / 77.6 / 149.7 / 288.6 / 560.7   1: 54.8 / 83.9 / 155.0 / 296.4 / 572.4   2: 70.2 / 66.1 / 119.1 / 234.1 / 440.7
 // Tile size (data reuse) matters more than occupancy.
 void mmq_dispatch(const QMat& W, const int8_t* xq, const float* xd, const float* xsd, float* y, int T, int ldy,
-                  int cfg, cudaStream_t s) {
-    if (cfg == 1) mmq_launch<64, 2, 2>(W, xq, xd, xsd, y, T, ldy, s);
-    else if (cfg == 2) mmq_launch<128, 2, 1>(W, xq, xd, xsd, y, T, ldy, s);
-    else mmq_launch<64, 3, 1>(W, xq, xd, xsd, y, T, ldy, s);
+                  int cfg, int nsplit, cudaStream_t s) {
+    if (cfg == 1) mmq_launch<64, 2, 2>(W, xq, xd, xsd, y, T, ldy, nsplit, s);
+    else if (cfg == 2) mmq_launch<128, 2, 1>(W, xq, xd, xsd, y, T, ldy, nsplit, s);
+    else mmq_launch<64, 3, 1>(W, xq, xd, xsd, y, T, ldy, nsplit, s);
+}
+
+// K splits for one int8 GEMM launch. Blocks run one per SM, so a grid of `blocks` takes ceil(blocks / n_sm) waves;
+// with 4096-row matrices and short chunks that is 1.33 or 2.67 waves, and the last wave leaves most SMs idle.
+// Splitting K into z parts makes z times as many blocks, each 1/z as long: time ~ ceil(z * blocks / slots) / z.
+// Pick the z in 1..max that minimizes it (ties: fewer splits), with z dividing the super-blocks of K, at least 4
+// super-blocks (1024 K) per split, the partial sums fitting the scratch buffer, and a predicted gain of >= 20%.
+int splitk_choose(const ak_q35_model* m, int blocks, int per_sm, int K, int T, int rows) {
+    if (m->splitk_max <= 1 || m->n_sm <= 0) return 1;
+    const int sb = K / 256;
+    const int slots = m->n_sm * per_sm;  // blocks resident at once
+    int best = 1;
+    const double t1 = std::ceil(static_cast<double>(blocks) / slots);
+    double best_t = t1;
+    for (int z = 2; z <= m->splitk_max; ++z) {
+        if (sb % z != 0 || sb / z < 4) continue;
+        if (static_cast<size_t>(z) * T * rows > m->splitk_n) continue;
+        const double t = std::ceil(static_cast<double>(z) * blocks / slots) / z;
+        // Measured (benchmarks/gemm_bench.cu): the wave model overstates small gains (the reduction pass and the
+        // shorter per-block K loops cost something), so only split when it predicts at least 20% less time.
+        if (t < best_t - 1e-9 && t <= 0.8 * t1) {
+            best_t = t;
+            best = z;
+        }
+    }
+    return best;
 }
 
 // y = A (or [A; B]) x for T columns of b's activations.
@@ -1570,7 +1627,15 @@ ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a
             };
             if (m->qdiag != 2) {  // pipelined cp.async kernels (AK_Q35_QDIAG=2: the plain register-staged ones)
                 const int cfg = T <= 64 ? m->mmq_short : m->mmq_long;
-                mmq_dispatch(W, m->xq8, m->xd8, m->xsd8, yy, T, ystride, cfg, s);
+                const int bn = cfg == 2 ? 128 : 64;
+                const int blocks = ((T + bn - 1) / bn) * ((W.rows + BM - 1) / BM);
+                const int z = splitk_choose(m, blocks, cfg == 1 ? 2 : 1, W.K, T, W.rows);
+                if (z == 1) {
+                    mmq_dispatch(W, m->xq8, m->xd8, m->xsd8, yy, T, ystride, cfg, 1, s);
+                } else {
+                    mmq_dispatch(W, m->xq8, m->xd8, m->xsd8, m->splitk, T, W.rows, cfg, z, s);
+                    k_splitk_sum<<<dim3((W.rows + 255) / 256, T), 256, 0, s>>>(m->splitk, z, W.rows, T, yy, ystride);
+                }
             } else if (T <= 128) {
                 if (W.type == 1) launch(k_qgemm8<1, 128, 64>, 64, 128);
                 else launch(k_qgemm8<2, 128, 64>, 64, 128);
@@ -1686,22 +1751,28 @@ ak_status emit_target(ak_q35_model* m, const Bufs& b, int T, int save_mode, Prof
     k_embed<<<T, 256, 0, s>>>(m->embd_dev, m->embd_type, b.tok, b.x, d);
     mark(p, s, kKEmbed);
     const float* pending = nullptr;
+    const SnapReq sr = m->snapreq;
+    const size_t snap_nc = 3 * static_cast<size_t>(m->conv_ch);
+    const size_t snap_layer = snap_nc + static_cast<size_t>(m->hv) * kDk * kDk;
+    size_t li = 0;  // linear layers so far (index into a snapshot slot)
     for (int l = 0; l < m->n_layers && st == AK_OK; ++l) {
         const Layer& L = m->layers[l];
         k_norm<<<T, 1024, 0, s>>>(b.x, pending, L.attn_norm, hq.q, hq.d, hq.h, d, m->eps, nullptr);
         mark(p, s, kKNorm);
         if (L.linear) {
+            const size_t sr_off = li++ * snap_layer;
             float* qkv = b.big;  // per column: [conv_ch | z d_inner]
             st = mm2(m, b, L.wqkv, L.wz, hq, qkv, m->big_n, T);
             mark(p, s, kKGemvQkv);
             if (st == AK_OK) st = mm2(m, b, L.walpha, L.wbeta, hq, b.ab, 2 * m->hv, T);
             mark(p, s, kKGemvAb);
-            k_conv<<<(m->conv_ch + 255) / 256, 256, 0, s>>>(qkv, m->big_n, L.conv_state, L.conv_save, ctl, L.conv_w,
-                                                            b.conv_out, m->conv_ch, T, save_mode);
+            (sr.n ? k_conv<true> : k_conv<false>)<<<(m->conv_ch + 255) / 256, 256, 0, s>>>(
+                qkv, m->big_n, L.conv_state, L.conv_save, ctl, L.conv_w, b.conv_out, m->conv_ch, T, save_mode, sr,
+                sr_off);
             mark(p, s, kKConv);
-            k_gdn<<<dim3(m->hv, kDk / 16), 256, 0, s>>>(b.conv_out, m->conv_ch, b.ab, L.dt_bias, L.ssm_a, L.gdn_state,
-                                                        L.k_save, L.v_save, L.db_save, ctl, b.o, m->d_inner, m->hk,
-                                                        m->hv, m->eps, T, save_mode);
+            (sr.n ? k_gdn<true> : k_gdn<false>)<<<dim3(m->hv, kDk / 16), 256, 0, s>>>(
+                b.conv_out, m->conv_ch, b.ab, L.dt_bias, L.ssm_a, L.gdn_state, L.k_save, L.v_save, L.db_save, ctl,
+                b.o, m->d_inner, m->hk, m->hv, m->eps, T, save_mode, sr, sr_off + snap_nc);
             mark(p, s, kKGdn);
             k_gated_norm<<<dim3(m->hv, T), kDk, 0, s>>>(b.o, qkv + m->conv_ch, m->big_n, L.ssm_norm, aq.q, aq.d, aq.h,
                                                         m->d_inner, m->eps);
@@ -1847,6 +1918,21 @@ ak_status reset(ak_q35_model* m) {
 
 // Save (or restore) every linear layer's conv + delta-rule state to (from) snapshot slot `slot`. Only valid when
 // no replay is pending, i.e. right after a prefill.
+// Allocate snapshot slot `slot` on first use.
+ak_status snap_ensure(ak_q35_model* m, int slot) {
+    if (slot < 0 || slot >= AK_Q35_CACHE_SLOTS) {
+        ak_set_error("qwen35 cache: slot out of range");
+        return AK_ERR_INVALID;
+    }
+    if (m->snap[slot]) return AK_OK;
+    size_t n_lin = 0;
+    for (const Layer& L : m->layers) n_lin += L.linear ? 1 : 0;
+    const size_t per = 3 * static_cast<size_t>(m->conv_ch) + static_cast<size_t>(m->hv) * kDk * kDk;
+    const ak_status st = dalloc_n(m, &m->snap[slot], n_lin * per);
+    m->info.vram_mb = static_cast<float>(m->dev_bytes / (1024.0 * 1024.0));
+    return st;
+}
+
 ak_status snap_copy(ak_q35_model* m, int slot, bool save) {
     if (slot < 0 || slot >= AK_Q35_CACHE_SLOTS) {
         ak_set_error("qwen35 cache: slot out of range");
@@ -1854,18 +1940,12 @@ ak_status snap_copy(ak_q35_model* m, int slot, bool save) {
     }
     const size_t nc = 3 * static_cast<size_t>(m->conv_ch);
     const size_t ng = static_cast<size_t>(m->hv) * kDk * kDk;
-    size_t n_lin = 0;
-    for (const Layer& L : m->layers) n_lin += L.linear ? 1 : 0;
-    ak_status st = AK_OK;
-    if (!m->snap[slot]) {
-        if (!save) {
-            ak_set_error("qwen35 cache: slot is empty");
-            return AK_ERR_INVALID;
-        }
-        st = dalloc_n(m, &m->snap[slot], n_lin * (nc + ng));
-        if (st != AK_OK) return st;
-        m->info.vram_mb = static_cast<float>(m->dev_bytes / (1024.0 * 1024.0));
+    if (!m->snap[slot] && !save) {
+        ak_set_error("qwen35 cache: slot is empty");
+        return AK_ERR_INVALID;
     }
+    ak_status st = snap_ensure(m, slot);
+    if (st != AK_OK) return st;
     float* p = m->snap[slot];
     cudaStream_t s = m->stream;
     for (Layer& L : m->layers) {
@@ -1954,12 +2034,20 @@ ak_status ensure_pf(ak_q35_model* m) {
         if (ms) m->mmq_short = std::atoi(ms);
         const char* ml = std::getenv("AK_Q35_MMQ_LONG");
         if (ml) m->mmq_long = std::atoi(ml);
+        const char* sk = std::getenv("AK_Q35_SPLITK");
+        if (sk) m->splitk_max = std::max(1, std::atoi(sk));
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&m->n_sm, cudaDevAttrMultiProcessorCount, dev);
     }
     {  // int8 activations: the widest K of any prefill matrix (FFN down: ff, MTP eh_proj: 2 d)
         const size_t kmax = std::max<size_t>(m->ff, 2 * static_cast<size_t>(m->d));
         if (st == AK_OK) st = dalloc_n(m, &m->xq8, kmax * cols);
         if (st == AK_OK) st = dalloc_n(m, &m->xd8, kmax / 32 * cols);
         if (st == AK_OK) st = dalloc_n(m, &m->xsd8, kmax / 32 * cols);
+        // split-K partials: room for 4 splits of a d-row matrix over 256 tokens (16 MB); larger cases do not split
+        m->splitk_n = static_cast<size_t>(4) * 256 * m->d;
+        if (st == AK_OK) st = dalloc_n(m, &m->splitk, m->splitk_n);
     }
     if (st == AK_OK) st = ck(cudaHostAlloc(reinterpret_cast<void**>(&m->h_pf), sizeof(int) * 2 * cols, 0));
     Bufs b;
@@ -1976,17 +2064,41 @@ ak_status ensure_pf(ak_q35_model* m) {
 // dec.hbuf column *last_col and its logits m->logits column *last_col. With fill_mtp, the MTP KV cache gets every
 // prompt pair (h_i, t_{i+1}).
 // Only positions [begin, end) are processed (end < 0: n); MTP pairs still look ahead to prompt[end] when end < n.
+// snaps: {position, slot} pairs, increasing, in (begin, end]: the recurrent state after prompt[0, position) is saved
+// into the slot. Each is taken inside the pass that covers it (SnapReq), so snapshots do not split the prompt.
+// GEMM chunks are balanced (rem tokens -> ceil(rem / pf_cols) equal chunks), so no remainder of <= kPfMin tokens is
+// left for the GEMV path, which reads all weights once per kMaxCols tokens.
 ak_status prefill(ak_q35_model* m, const int32_t* prompt, int n, int use_graph, bool fill_mtp, int* last_col,
-                  int begin = 0, int end = -1) {
+                  int begin = 0, int end = -1, const std::vector<std::pair<int, int>>* snaps = nullptr) {
     ak_status st = AK_OK;
     cudaStream_t s = m->stream;
     if (end < 0) end = n;
+    size_t next_snap = 0;
     for (int s0 = begin; s0 < end && st == AK_OK;) {
         const int rem = end - s0;
         int T;
-        if (rem > kPfMin && !m->no_pf && (st = ensure_pf(m)) == AK_OK) {
+        const bool gemm = rem > kPfMin && !m->no_pf && (st = ensure_pf(m)) == AK_OK;
+        if (st != AK_OK) break;
+        if (gemm) {
+            const int parts = (rem + m->pf_cols - 1) / m->pf_cols;
+            T = std::min(m->pf_cols, (rem + parts - 1) / parts);
+        } else {
+            T = std::min(kMaxCols, rem);
+        }
+        SnapReq sr{};
+        while (snaps && next_snap < snaps->size() && (*snaps)[next_snap].first <= s0 + T) {
+            const auto [at, slot] = (*snaps)[next_snap++];
+            if (at <= s0) continue;  // not inside this range (caller error); skip rather than save a wrong state
+            st = snap_ensure(m, slot);
+            if (st != AK_OK) break;
+            sr.base[sr.n] = m->snap[slot];
+            sr.col[sr.n] = at - s0 - 1;
+            ++sr.n;
+        }
+        if (st != AK_OK) break;
+        m->snapreq = sr;
+        if (gemm) {
             const Bufs& b = m->pf;
-            T = std::min(m->pf_cols, rem);
             std::memcpy(m->h_pf, prompt + s0, sizeof(int) * T);
             st = ck(cudaMemcpyAsync(b.tok, m->h_pf, sizeof(int) * T, cudaMemcpyHostToDevice, s));
             if (st == AK_OK) st = set_ctl(m, s0, 0, 0, s0 + 1);
@@ -1999,13 +2111,12 @@ ak_status prefill(ak_q35_model* m, const int32_t* prompt, int n, int use_graph, 
             }
             *last_col = 0;
         } else {
-            if (st != AK_OK) break;
             const Bufs& b = m->dec;
-            T = std::min(kMaxCols, rem);
             std::memcpy(pin_tok(m), prompt + s0, sizeof(int) * T);
             st = ck(cudaMemcpyAsync(b.tok, pin_tok(m), sizeof(int) * T, cudaMemcpyHostToDevice, s));
             if (st == AK_OK) st = set_ctl(m, s0, 0, 0, s0 + 1);
-            if (st == AK_OK) st = target(m, T, 0, use_graph);
+            // a captured graph would bake in the snapshot request, so passes that take one run eagerly
+            if (st == AK_OK) st = target(m, T, 0, sr.n ? 0 : use_graph);
             const int tm = std::min(s0 + T, n - 1) - s0;
             if (fill_mtp && tm > 0 && st == AK_OK) {
                 std::memcpy(pin_mtok(m), prompt + s0 + 1, sizeof(int) * tm);
@@ -2014,9 +2125,11 @@ ak_status prefill(ak_q35_model* m, const int32_t* prompt, int n, int use_graph, 
             }
             *last_col = T - 1;
         }
+        m->snapreq = SnapReq{};
         if (st == AK_OK) st = ck(cudaStreamSynchronize(s));  // before the pinned staging is reused
         s0 += T;
     }
+    m->snapreq = SnapReq{};
     return st;
 }
 
@@ -2546,13 +2659,10 @@ ak_status spec_run(ak_q35_model* m, const int32_t* prompt, int n_prompt, int32_t
     }
     const auto t0 = std::chrono::steady_clock::now();
     int lc = 0;
-    int from = start;
-    for (auto [at, slot] : snaps) {
-        if (st == AK_OK) st = prefill(m, prompt, n_prompt, 1, true, &lc, from, at);
-        if (st == AK_OK) st = snap_copy(m, slot, true);
-        from = at;
-    }
-    if (st == AK_OK) st = prefill(m, prompt, n_prompt, 1, true, &lc, from, n_prompt);
+    // One prefill over [start, n_prompt); the snapshots are taken inside whichever pass covers their position.
+    // (Before, each snapshot ended a segment, so every turn paid one extra pass - all weights read once, ~22 ms -
+    // for the few tokens after the last snapshot, plus a GEMV pass per short segment tail.)
+    if (st == AK_OK) st = prefill(m, prompt, n_prompt, 1, true, &lc, start, n_prompt, &snaps);
     int* res = pin_res(m);
     if (st == AK_OK) st = ck(cudaMemcpy(res, m->d_arg + lc, sizeof(int), cudaMemcpyDeviceToHost));
     const auto t1 = std::chrono::steady_clock::now();
@@ -2748,6 +2858,40 @@ extern "C" ak_status ak_q35_cache_load(ak_q35_model* m, int slot) {
         return AK_ERR_INVALID;
     }
     return snap_copy(m, slot, false);
+}
+
+extern "C" ak_status ak_q35_set_splitk(ak_q35_model* m, int max_split) {
+    if (!m) {
+        ak_set_error("qwen35 set_splitk: null model");
+        return AK_ERR_INVALID;
+    }
+    m->splitk_max = std::max(1, std::min(max_split, 16));
+    return AK_OK;
+}
+
+extern "C" ak_status ak_q35_cache_save(ak_q35_model* m, int slot) {
+    if (!m) {
+        ak_set_error("qwen35 cache: null model");
+        return AK_ERR_INVALID;
+    }
+    return snap_copy(m, slot, true);
+}
+
+extern "C" ak_status ak_q35_cache_read(ak_q35_model* m, int slot, float* out, size_t n, size_t* n_total) {
+    if (!m || slot < 0 || slot >= AK_Q35_CACHE_SLOTS) {
+        ak_set_error("qwen35 cache read: bad arguments");
+        return AK_ERR_INVALID;
+    }
+    size_t n_lin = 0;
+    for (const Layer& L : m->layers) n_lin += L.linear ? 1 : 0;
+    const size_t total = n_lin * (3 * static_cast<size_t>(m->conv_ch) + static_cast<size_t>(m->hv) * kDk * kDk);
+    if (n_total) *n_total = total;
+    if (!out || n == 0) return AK_OK;
+    if (!m->snap[slot]) {
+        ak_set_error("qwen35 cache read: slot is empty");
+        return AK_ERR_INVALID;
+    }
+    return ck(cudaMemcpy(out, m->snap[slot], sizeof(float) * std::min(n, total), cudaMemcpyDeviceToHost));
 }
 
 extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
