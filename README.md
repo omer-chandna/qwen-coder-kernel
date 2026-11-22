@@ -44,7 +44,7 @@ RTX 4060, with an OpenAI-compatible server so OpenCode (or Continue, Aider, ...)
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\serve.ps1   # http://127.0.0.1:8090/v1
 # OpenCode → adakernel/qwen3.8-9b
-#   100-350 tok/s on coding tasks · agent follow-up steps start in 0.05-0.45 s
+#   100-350 tok/s on coding tasks · agent follow-up steps start in 0.05-0.4 s
 ```
 
 ## Features
@@ -64,9 +64,9 @@ powershell -ExecutionPolicy Bypass -File scripts\serve.ps1   # http://127.0.0.1:
   tok/s on coding tasks (the high end when the answer copies code from the prompt).
 - **Rollback:** replay-commit for the recurrent state, so rejected drafts cost no state copies.
 - **Batched prefill:** int8 tensor-core GEMMs (fused FFN gate / up / SiLU, split-K for short chunks), tensor-core
-  FlashAttention-style attention and a shuffle-light delta-rule kernel: a 6k-token prompt from cold in 3.5 s.
+  FlashAttention-style attention and a shuffle-light delta-rule kernel: a 6k-token prompt from cold in ~3.3 s.
 - **Prefix cache:** recurrent-state snapshots at chat-message boundaries, taken inside the prefill pass, so each agent
-  step only processes what is new (0.05-0.45 s for 20-750 new tokens instead of re-reading 7k-24k tokens).
+  step only processes what is new (0.05-0.4 s for 20-750 new tokens instead of re-reading 7k-24k tokens).
 - **Server:** `adakernel/serve.py`, OpenAI chat completions with streaming and tool calls, rendered with the GGUF's own
   chat template.
 
@@ -86,7 +86,11 @@ exactly the greedy tokens). llama.cpp's plain greedy decode on this card is 44 t
 | write tests (2368) | 100 tok/s |
 
 Agent-style session replay (`benchmarks/chunk_profile.py`, 40k context): the first request with a 6k-token prompt
-takes 3.5 s; follow-up requests that add 50 / 148 / 375 / 748 / 1446 tokens take 0.05 / 0.14 / 0.21 / 0.44 / 0.92 s.
+takes ~3.3 s; follow-up requests that add 50 / 148 / 375 / 748 / 1446 tokens take 0.05 / 0.13 / 0.21 / 0.41 / 0.88 s.
+
+Where it stands: decode of MTP-drafted output is within ~10% of the card's memory-bandwidth limit, and prompt
+reading is ~87% int8 tensor-core GEMMs at about a third of their peak. The current-state summary, every
+optimization with its measurements and reasoning, and what is left are in [docs/QWEN38_9B.md](docs/QWEN38_9B.md).
 
 Earlier end-to-end comparison against llama.cpp (three chat requests from the original benchmark, 256 generated
 tokens each, before the optimizations in docs/QWEN38_9B.md after "Tensor-core attention"):
@@ -175,6 +179,20 @@ python -m pytest tests -q
 
 `tests/test_serve.py` runs on the CPU. `tests/test_qwen35.py` loads the model on the GPU (~6 GB). Set `LLAMA_CPP_BIN`
 to a llama.cpp `build/bin` folder to also check token and greedy-output parity with llama.cpp.
+
+### Benchmarks
+
+| Command | What it measures |
+|---|---|
+| `python -m benchmarks.decode_bench` | speculative decode tok/s on six coding prompts, plus a logits hash for bit-exactness checks across builds |
+| `python -m benchmarks.chunk_profile` | GPU time per prefill chunk by kernel group, and an agent-session replay (first turn + follow-ups) |
+| `python -m benchmarks.long_context` | prompt reading and decode at 4k-36k context |
+| `python -m benchmarks.llama_match` | how long greedy output agrees with `llama-completion --temp 0` |
+| `scripts\cuda_bench.ps1 -Bench attn` / `-Bench gemm` | attention or int8 GEMM kernels alone on random data (no model load): bit equality and timing |
+| `scriptsb_profile.ps1 -A <checkout> -B <checkout>` | interleaved A/B of `chunk_profile` between two builds |
+| `python -m benchmarks.sass_hotspots <sass.csv>` | summarizes an Nsight Compute SASS export (stalls by opcode, bank conflicts) |
+
+The model benchmarks load the model on the GPU (~6 GB), so stop the server first or wait for it to be idle.
 
 ## How it works
 

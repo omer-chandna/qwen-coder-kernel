@@ -9,6 +9,65 @@ Machine: RTX 4060 8 GB, Ryzen 5 7600X, Windows 11. Model: Ollama `eriktonon/qwen
 DeltaNet, 8 gated full attention (every fourth), plus one MTP (multi-token prediction) block, used as the speculative draft. llama.cpp commit
 `5d4c8ee`, `-ngl 99 -fa 1`. Raw numbers (gitignored): `experiments/results/qwen38_9b_decode.json`, `llamacpp_qwen38_9b.json`.
 
+## Current state (read this first)
+
+This document is a log. Sections appear in the order the work was done, and earlier sections keep the numbers that
+were true when they were written. This summary gives the current numbers and a map of the log.
+
+**Where it stands** (RTX 4060 8 GB):
+
+| | |
+|---|---|
+| Decode, speculative, six coding tasks (`benchmarks/decode_bench.py`) | 100-352 tok/s (llama.cpp plain greedy: 44) |
+| Decode step, target pass, 1 column | 22.2 ms at short context, 26.7 ms at 32k |
+| Verify pass, 12 columns | 30.4 ms (was 50.3) |
+| First agent turn, 6k-token prompt from cold (`benchmarks/chunk_profile.py`) | ~3.3 s (~1830 tok/s; llama.cpp ~2230) |
+| Follow-up turns, 50 / 148 / 375 / 748 / 1446 new tokens | 0.05 / 0.13 / 0.21 / 0.41 / 0.88 s |
+| 512-token prefill chunk at position 0 | 247 ms: int8 GEMMs 214, delta rule 16, rest 13, attention 3.5 |
+
+Output is bit-identical to greedy decoding (speculative output == greedy, asserted in the tests). All 26 tests
+pass, and greedy output matches llama.cpp for 64 tokens on 6 of 6 prompts (`benchmarks/llama_match.py`).
+
+**Where the time goes, and what is left.**
+- **Decode** of MTP-drafted output runs within ~10% of the card's memory-bandwidth limit (4.9 GB of weights per
+  pass). Going faster needs more accepted draft tokens per round, not faster kernels.
+- **Prompt reading** is ~87% int8 GEMMs, at about a third of the int8 tensor-core peak. A deeper GEMM redesign
+  (warp-specialized loading) might make prompt reading 20-35% faster. In an agent loop that is ~1 s once per
+  session and ~3-7% per step, because decoding the reply dominates each step. It was judged not worth the risk for
+  now; see "Next".
+
+**Map of the log** (the main takeaway of each section):
+
+| section | takeaway |
+|---|---|
+| Runtime ... Coding workload | the original runtime: dp4a GEMVs, MTP + prompt-lookup speculation, prefix cache |
+| Tensor-core attention, Fused quantized-weight GEMM, int8 tensor cores | batched prefill on tensor cores |
+| Attention v2 | `ldmatrix` + staggered `cp.async`: 3.3x on long-context attention, bit-identical |
+| Agent turns: split-K, snapshots inside a chunk | idle SMs on short chunks; snapshots that split every turn into an extra pass |
+| Decode: verify-pass cost, the draft policy | register-starved wide verify; a draft policy that never explored prompt lookup |
+| Delta-rule kernel | shuffle throughput was the limit: 8 lanes per state row, 2.7x |
+| Wide verify | activation loads shared across 2-3 weight rows: 253 -> 353 tok/s on code edits |
+| Draft policy v2 | acceptance depends on n-gram match length; an agreement gate against bad lookups |
+| Fused FFN gate + up + SiLU | removes a 100 MB-per-layer round trip (small net gain) |
+| Split attention | slices tiered by key position, so decode and verify still merge identically |
+| Profiling the int8 GEMM | Nsight Compute: issue-bound with 2 warps per scheduler, plus Q6_K bank conflicts and copy overhead: Q6_K -30% |
+| Next | what is left, what each item would buy, and why it was not done |
+
+**Lessons that held across the rounds:**
+- **Measure the part before optimizing it.** Several plausible fixes measured as no gain or a loss: reordering
+  mmas, vectorizing scale loads, precomputed activation sums, a cheaper verify epilogue, 16-warp GEMM blocks. The
+  wins came from measured bottlenecks: idle SMs, register starvation, shuffle throughput, bank conflicts, an
+  exploration bug in the draft policy.
+- **Kernel-only harnesses** (`benchmarks/attn_bench.cu`, `gemm_bench.cu`, `scripts\cuda_bench.ps1`) check bit
+  equality and time a kernel in seconds, without loading the model.
+- **Keep arithmetic identical where possible.** A bit-identical change is verified by comparing bytes. When rounding
+  must change, keep decode and verify on the same arithmetic, so speculative output still equals greedy, and check
+  against llama.cpp.
+- **Use interleaved A/B runs** (`scripts\ab_profile.ps1`) and frozen inputs (`benchmarks/data`, `tests/data`).
+  Thermal drift and inputs taken from live source files both produced false conclusions before.
+- **Token-level checks can pass wrong code.** A snapshot one column off still produced the right 24 greedy tokens.
+  Compare state, and confirm a test fails on a deliberately broken build.
+
 ## Runtime
 
 `native/cuda/qwen35_model.cu`, Python `adakernel.qwen35.Qwen35Model`. Matrices go through the existing dp4a GEMVs.
@@ -880,7 +939,12 @@ at short context and 26.7 at 32k (attention 4.8 ms).
 - **The int8 GEMMs** are still ~85% of prompt reading (see "Profiling the int8 GEMM"). What is left is the
   per-sub-block float epilogue with 2 warps per scheduler. More warps need a smaller per-block footprint or
   warp-specialized loading, and the barrier cost then grows.
-- **8-bit KV cache.** At 32k, decode attention is 18% of a step and already at bandwidth (1.07 GB in 4.8 ms), so int8
+  - Estimated gain: 18-20 -> 25-30 TMAC/s, so prompt reading 20-35% faster: the first turn ~3.3 -> ~2.4 s, and
+    follow-up steps 3-7% faster.
+  - Not done: decoding the reply dominates each agent step, and the obvious route (more warps per block) already
+    measured slower in two variants. Worth revisiting for workloads with many long fresh prompts.
+- **8-bit KV cache** (on hold). This quantizes the runtime attention cache, not the model, whose weights are already
+  Q4_K_M. At 32k, decode attention is 18% of a step and already at bandwidth (1.07 GB in 4.8 ms), so int8
   K / V with per-32 scales would save ~2.4 ms per step (~9%) and double the context that fits in 8 GB (~40k -> ~80k).
   The cost is a dequantize step in the tensor-core attention kernel (cp.async cannot convert), which would slow
   long-context prefill attention unless it overlaps with the mma work.
