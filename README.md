@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>A custom CUDA kernel that runs Qwen faster in OpenCode.</b><br>
-  106-127 tok/s on coding tasks on an 8 GB RTX 4060 (llama.cpp: 44), with output bit-identical to greedy decoding.
+  100-350 tok/s decoding coding tasks on an 8 GB RTX 4060 (llama.cpp: 44), with output bit-identical to greedy decoding.
 </p>
 
 <p align="center">
@@ -44,7 +44,7 @@ RTX 4060, with an OpenAI-compatible server so OpenCode (or Continue, Aider, ...)
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\serve.ps1   # http://127.0.0.1:8090/v1
 # OpenCode → adakernel/qwen3.8-9b
-#   106-127 tok/s on coding tasks · agent steps start in 0.3-0.55 s
+#   100-350 tok/s on coding tasks · agent follow-up steps start in 0.05-0.45 s
 ```
 
 ## Features
@@ -60,18 +60,36 @@ powershell -ExecutionPolicy Bypass -File scripts\serve.ps1   # http://127.0.0.1:
 
 - **Decode:** dp4a GEMVs on Q4_K / Q6_K / Q8_0 weights, CUDA graphs, fused ops: 46 tok/s plain greedy (llama.cpp: 44).
 - **Speculative decoding:** MTP-head drafts and prompt-lookup drafts, chosen per round from measured costs, verified up
-  to 12 tokens per pass. Output is bit-identical to greedy. 106-127 tok/s on coding tasks.
+  to 12 tokens per pass, with acceptance tracked by n-gram match length. Output is bit-identical to greedy. 100-350
+  tok/s on coding tasks (the high end when the answer copies code from the prompt).
 - **Rollback:** replay-commit for the recurrent state, so rejected drafts cost no state copies.
-- **Batched prefill:** fp16 tensor-core GEMMs in 1024-token chunks (~1100 tok/s at 4k context).
-- **Prefix cache:** recurrent-state snapshots at chat-message boundaries, so each agent step only processes what is new
-  (0.3-0.5 s per step instead of re-reading 7k-24k tokens).
+- **Batched prefill:** int8 tensor-core GEMMs (fused FFN gate / up / SiLU, split-K for short chunks), tensor-core
+  FlashAttention-style attention and a shuffle-light delta-rule kernel: a 6k-token prompt from cold in 3.5 s.
+- **Prefix cache:** recurrent-state snapshots at chat-message boundaries, taken inside the prefill pass, so each agent
+  step only processes what is new (0.05-0.45 s for 20-750 new tokens instead of re-reading 7k-24k tokens).
 - **Server:** `adakernel/serve.py`, OpenAI chat completions with streaming and tool calls, rendered with the GGUF's own
   chat template.
 
 ## Numbers
 
-Three chat requests carrying real source code, 256 generated tokens each, RTX 4060 8 GB, model
-`eriktonon/qwen3.8-uncensored:9b` (Q4_K_M). Every mode produced exactly the greedy tokens.
+Current build, RTX 4060 8 GB, model `eriktonon/qwen3.8-uncensored:9b` (Q4_K_M). Decode speed of speculative decoding
+on six coding chat requests over this repo's own source (`benchmarks/decode_bench.py`, 256 tokens each; output is
+exactly the greedy tokens). llama.cpp's plain greedy decode on this card is 44 tok/s.
+
+| Task (prompt tokens) | decode |
+|---|---:|
+| refactor a function (1138) | **352 tok/s** |
+| add comments, return the code (1073) | **206 tok/s** |
+| implement from a description (86) | 116 tok/s |
+| translate to Python (984) | 111 tok/s |
+| explain code (1680) | 109 tok/s |
+| write tests (2368) | 100 tok/s |
+
+Agent-style session replay (`benchmarks/chunk_profile.py`, 40k context): the first request with a 6k-token prompt
+takes 3.5 s; follow-up requests that add 50 / 148 / 375 / 748 / 1446 tokens take 0.05 / 0.14 / 0.21 / 0.44 / 0.92 s.
+
+Earlier end-to-end comparison against llama.cpp (three chat requests from the original benchmark, 256 generated
+tokens each, before the optimizations in docs/QWEN38_9B.md after "Tensor-core attention"):
 
 | Task (prompt tokens) | llama.cpp | this kernel, greedy | **this kernel, spec** |
 |---|---:|---:|---:|
