@@ -111,7 +111,7 @@ The server reads the weights straight from Ollama's store
 ### Run with OpenCode
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\serve.ps1            # -Ctx 32768 -Port 8090 -Model <gguf>
+powershell -ExecutionPolicy Bypass -File scripts\serve.ps1            # -Ctx 40960 -PfCols 512 -Port 8090 -Model <gguf>
 ```
 
 Then pick `adakernel/qwen3.8-9b` in OpenCode. To load a different GGUF with the same `qwen35` layout, pass its path
@@ -133,7 +133,7 @@ with `-Model` (only Qwen3.8 9B has been tested).
           "modelID": "qwen3.8-9b",
           "name": "Qwen3.8 9B (AdaKernel)",
           "capabilities": { "tools": true, "input": ["text"], "output": ["text"] },
-          "limit": { "context": 32768, "output": 8192 }
+          "limit": { "context": 40960, "output": 4096 }
         }
       }
     }
@@ -146,8 +146,8 @@ The server uses port 8090 because OpenCode auto-discovers :8000 as vLLM with too
 </details>
 
 > [!NOTE]
-> One request at a time, greedy decoding only (temperature is ignored), 32k context by default (about 40k fits in
-> 8 GB).
+> One request at a time, greedy decoding only (temperature is ignored), 40k context by default (peaks at ~7.7 GB on an 8 GB card;
+> `-Ctx 32768 -PfCols 1024` leaves more room for other apps).
 
 ### Tests
 
