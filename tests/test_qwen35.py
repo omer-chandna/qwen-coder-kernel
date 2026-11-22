@@ -190,6 +190,7 @@ def test_tensor_core_decode_matches_scalar(model):
 def test_fused_quantized_gemm_matches_cublas(model):
     """Prefill with the fused dequant + mma GEMM (both token-tile widths) against fp16 expansion + cuBLAS."""
     ids = tokenize(MODEL, _long_prompt())
+    model.set_int8(False)
     try:
         model.set_qgemm(0)
         ref = model.logits(ids)
@@ -200,22 +201,25 @@ def test_fused_quantized_gemm_matches_cublas(model):
         short_ref = model.logits(ids[:100])  # 64-token tiles
     finally:
         model.set_qgemm(768)
+        model.set_int8(True)
     for a, b in ((ref, fused), (short_ref, short)):
         assert int(np.argmax(a)) == int(np.argmax(b))
         assert np.corrcoef(a, b)[0, 1] > 0.9999
 
 
-def test_int8_gemm_matches_reference(model):
-    """Opt-in int8 tensor-core GEMM (chunks <= 128 tokens) against fp16 expansion + cuBLAS: Q8_1-level agreement."""
-    ids = tokenize(MODEL, _long_prompt())[:120]  # one 120-token prefill chunk
+@pytest.mark.parametrize("n", [120, None])
+def test_int8_gemm_matches_reference(model, n):
+    """int8 tensor-core GEMMs (default) against fp16 expansion + cuBLAS, for a 64-token-tile chunk (120 tokens) and
+    the 128-token-tile pipelined kernel (the full ~1500-token prompt): Q8_1-level agreement, like the GEMV path."""
+    ids = tokenize(MODEL, _long_prompt())
+    ids = ids[:n] if n else ids
     try:
+        model.set_int8(False)
         model.set_qgemm(0)
         ref = model.logits(ids)
+    finally:
         model.set_qgemm(768)
         model.set_int8(True)
-        got = model.logits(ids)
-    finally:
-        model.set_int8(False)
-        model.set_qgemm(768)
+    got = model.logits(ids)
     assert int(np.argmax(ref)) == int(np.argmax(got))
     assert np.corrcoef(ref, got)[0, 1] > 0.999

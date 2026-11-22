@@ -27,8 +27,9 @@ def main() -> None:
     src = (ROOT / "native" / "cuda" / "qwen35_model.cu").read_text(encoding="utf-8")
     m = Qwen35Model(DEFAULT_MODEL, max_seq=args.ctx)
     tools_out = [src[i:i + n] for i, n in ((30000, 900), (42000, 1800), (52000, 3600))]  # ~300 / 600 / 1200 tokens
-    for name, q in (("cuBLAS", 0), ("fused", 768)):
+    for name, q, i8 in (("cuBLAS", 0, False), ("fp16", 768, False), ("int8", 768, True)):
         m.set_qgemm(q)
+        m.set_int8(i8)
         m.reset_cache()
         msgs = [{"role": "system", "content": "You are a coding agent. " + src[:18000]},
                 {"role": "user", "content": "Find the bug in spec_run."}]

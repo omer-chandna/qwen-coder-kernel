@@ -115,7 +115,7 @@ def _bind(lib) -> None:
     lib.ak_q35_set_attn.restype = ctypes.c_int
     lib.ak_q35_set_qgemm.argtypes = [vp, ctypes.c_int]
     lib.ak_q35_set_qgemm.restype = ctypes.c_int
-    lib.ak_q35_set_int8.argtypes = [vp, ctypes.c_int]
+    lib.ak_q35_set_int8.argtypes = [vp, ctypes.c_int, ctypes.c_int]
     lib.ak_q35_set_int8.restype = ctypes.c_int
     lib.ak_q35_logits.argtypes = [vp, vp, ctypes.c_int, ctypes.c_int, vp]
     lib.ak_q35_logits.restype = ctypes.c_int
@@ -352,10 +352,10 @@ class Qwen35Model:
         """Prefill chunks of up to max_cols tokens use the fused quantized GEMM (0: always cuBLAS, -1: always fused)."""
         self.native.check(self.native.lib.ak_q35_set_qgemm(self.handle, int(max_cols)))
 
-    def set_int8(self, on: bool) -> None:
-        """True: prefill chunks of <= 128 tokens run the GEMMs on int8 tensor cores (~15% faster, decode-path
-        accuracy); False (default): the fp16 fused kernel everywhere."""
-        self.native.check(self.native.lib.ak_q35_set_int8(self.handle, int(on)))
+    def set_int8(self, on: bool, max_cols: int = -1) -> None:
+        """True (default): prefill matrix products on int8 tensor cores (decode-path Q8_1 accuracy) for chunks of up
+        to max_cols tokens (-1: any); False: the fp16 fused kernel / cuBLAS (set_qgemm)."""
+        self.native.check(self.native.lib.ak_q35_set_int8(self.handle, int(on), int(max_cols)))
 
     def logits(self, prompt, graph: bool = True) -> np.ndarray:
         tokens = np.ascontiguousarray(prompt, dtype=np.int32)

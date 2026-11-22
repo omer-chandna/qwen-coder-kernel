@@ -222,37 +222,68 @@ overlapped across tiles.
 I also tried fp16 accumulation in cuBLAS (2x tensor rate on GeForce). It cut GEMM time per 512-token chunk only from
 350 to 282 ms, and greedy output diverged after 55 tokens on one of three prompts. Not adopted.
 
-## int8 tensor cores (`k_qgemm8`, opt-in)
+## int8 tensor cores (`k_mmq4` / `k_mmq6`, the default)
 
-The same fused kernel with integer arithmetic:
-- Activations are quantized to int8 per 32 values (scale and scaled sum), the decode path's Q8_1 scheme.
-- Q4_K nibbles are masked straight into int8 lanes; Q6_K becomes q - 32 via `__vsub4`.
-- `mma.m16n8k32.s8` runs per Q4_K sub-block and `mma.m16n8k16.s8` per Q6_K 16-group, followed by
-  `acc += d*sc*xd*dot - dmin*m*xsd`.
+Prefill matrix products run on int8 tensor cores with the decode path's arithmetic:
+- Activations are quantized to int8 per 32 values (Q8_1: scale and scaled sum), once per input.
+- Q4_K: an mma operand is a 4-byte nibble word, masked or shifted, so there is no decode pass at all. One
+  `mma.m16n8k32.s8` runs per 32-wide sub-block, then `acc += d*sc*xd*dot - dmin*m*xsd`.
+- Q6_K: operands are rebuilt from one `ql`, one `ql+32` and one `qh` word (`__vsub4` for q - 32), with one
+  `mma.m16n8k16.s8` per 16-group.
 
-It is correct (logit correlation 0.9994 against cuBLAS, the same as the GEMV prefill path), but barely faster.
-For every 32 values each output needs an int-to-float conversion and the weight and activation scales, and that
-scalar work, not the tensor cores, bounds it. The 128-token tile also needs ~186 registers (one block per SM), or
-spills when capped at 128.
+Accuracy is the GEMV prefill path's (logit correlation 0.9994 against cuBLAS; it was already the decode path's
+arithmetic). The fp16 kernels' output also drifts from cuBLAS after a few dozen greedy tokens on some prompts, so
+both are near-tie flips. All tests pass with it, including speculative == greedy and the prefix cache.
 
-GEMM ms per chunk, fp16 fused -> int8:
+How it got there, GEMM ms per 512-token chunk:
 
-| T = 32 | 64 | 128 | 512 |
+| step | GEMM ms | why |
+|---|---|---|
+| cuBLAS + fp16 expansion | 355 | |
+| fp16 fused (`k_qgemm`) | 309 | no expansion |
+| int8, first version | 457 | I2F conversions (quarter rate) + 186 registers or spills |
+| int8, `__int_as_float(v + 0x4B400000) - 1.5*2^23` | 265 | exact int -> float in two full-rate ops (sums < 2^22) |
+| int8, cp.async pipeline (Q4_K) | 235 | the plain kernel spent 143 of 276 ms just loading / decoding / syncing, at ~75 GB/s |
+| int8, cp.async pipeline (Q6_K too) | **229-234** | |
+
+Q6_K super-blocks are 210 bytes, so every other one starts 2 bytes off 4-byte alignment. The Q6_K kernel copies
+words from the aligned-down address with 4-byte `cp.async` and realigns them with a 16-bit funnel shift. The shift
+is uniform per stage, because it depends only on the super-block index.
+
+Tile shape beat occupancy. GEMM ms at T = 64 / 128 / 256 / 512 / 1024:
+- BN 64, 3 stages: 49 / 78 / 150 / 289 / 561.
+- BN 64, 2 blocks per SM: 55 / 84 / 155 / 296 / 572.
+- BN 128, 2 stages: 70 / **66** / **119** / **234** / **441**.
+
+So chunks of up to 64 tokens use BN 64 and longer ones BN 128.
+
+Per-256 activation scales with integer accumulation across sub-blocks were dropped. On Ada an integer multiply-add
+issues at half the FP32 rate, so 2 IMADs instead of ~5 float ops per output per 32 values saves little, and it would
+cost activation precision.
+
+End to end (40k context, 512-token chunks), `benchmarks/followup.py`, cuBLAS -> fp16 fused -> int8:
+
+| turn | cuBLAS | fp16 fused | int8 |
 |---|---|---|---|
-| 58.5 -> 49.6 | 60.1 -> 52.8 | 98.6 -> 86.7 | 310 -> 457 |
+| first, 6.0k tokens | 5.60 s | 4.94 s | **4.03 s** |
+| follow-up, 347 tokens | 0.44 s | 0.35 s | **0.29 s** |
+| follow-up, 748 tokens | 0.87 s | 0.74 s | **0.61 s** |
+| follow-up, 1446 tokens | 1.55 s | 1.43 s | **1.19 s** |
 
-It stays opt-in for chunks of up to 128 tokens (`set_int8(True)` / `AK_Q35_INT8=1`). Capping the fp16 kernels at
-128 registers (two blocks per SM) and removing a runtime-indexed register array that sat in local memory took the
-fp16 path a little further. Measured by `benchmarks/followup.py`:
-- First turn: 4.99 s.
-- Follow-ups of 346 / 774 / 1421 tokens: 0.37 / 0.75 / 1.45 s.
+`benchmarks/long_context.py` first reads: 4k 2.61 s, 12k 8.86 s, 24k 21.0 s, 36k 36.6 s (45.8 s before this round,
+66.4 s with the original kernels). Prompt reading at the start of a context is ~1700 tok/s, against llama.cpp's
+~2230.
+
+Switches: `set_int8(False)` / `AK_Q35_INT8=0` (fp16 fused / cuBLAS), `AK_Q35_MMQ_SHORT` / `AK_Q35_MMQ_LONG` (tile
+configurations) and `AK_Q35_QDIAG` (diagnostics).
 
 ## Next
 
-- **int8 that actually wins** needs integer accumulation across scale blocks, so the float rescale happens once per
-  super-block instead of once per 32 values. That means per-256 activation scales, which needs an accuracy check, or
-  folding the 6-bit sub-block scales into the integer sums. It also needs a deeper cp.async pipeline, so that weight
-  loads for later tiles are in flight while the current one is decoded and multiplied.
+- **The int8 GEMM is now latency-bound:** ~0.45 ms per token against an instruction-issue estimate of ~0.16. Options:
+  - a 256-row block of 16 warps, for more reuse per loaded activation tile (Q4_K fits in shared memory; Q6_K needs a
+    single stage);
+  - `ldmatrix` for the activation fragments;
+  - moving the Q4_K min term out of the inner loop.
 - `k_attn_mma` (47% of a chunk at 32k): cp.async double-buffering of the K/V tiles, `ldmatrix` fragment loads and
   more warps per block. Only one 4-warp block fits per SM today.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

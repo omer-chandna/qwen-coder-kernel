@@ -295,10 +295,14 @@ struct ak_q35_model {
     bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
     int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
                                          // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
-    bool int8_gemm = false;              // AK_Q35_INT8=1: chunks of <= 128 tokens on int8 tensor cores (~15% faster,
-                                         // decode-path (Q8_1) accuracy instead of fp16)
+    bool int8_gemm = true;               // prefill GEMMs on int8 tensor cores with Q8_1 activations, the decode path's
+                                         // arithmetic (AK_Q35_INT8=0: fp16 fused kernel / cuBLAS)
     int8_t* xq8 = nullptr;               // int8 prefill activations [pf_cols][max K]
     float *xd8 = nullptr, *xsd8 = nullptr;  // their per-32 scales and scale * sum
+    int int8_max = 1 << 30;              // longest chunk the int8 path takes (AK_Q35_INT8_MAX)
+    int mmq_short = 0, mmq_long = 2;     // pipelined int8 GEMM configurations (mmq_dispatch)
+    int qdiag = 0;                       // AK_Q35_QDIAG: 1 = the plain int8 kernel skips the math (timing only),
+                                         // 2 = Q4_K uses the plain int8 kernel instead of the pipelined one
     int draft_vocab = 0;                 // rows of the LM head the MTP draft scores (a prefix of the vocab)
     __half* w16 = nullptr;               // one matrix expanded to fp16 (prefill)
     size_t w16_n = 0;
@@ -1272,12 +1276,50 @@ Act act_hq(const Bufs& b) { return b.pf ? Act{nullptr, nullptr, b.a16} : Act{b.h
 Act act_aq(const Bufs& b) { return b.pf ? Act{nullptr, nullptr, b.a16} : Act{b.aq, b.ad, nullptr}; }
 Act act_fq(const Bufs& b) { return b.pf ? Act{nullptr, nullptr, b.a16} : Act{b.fq, b.fd, nullptr}; }
 
+// Pipelined int8 GEMM for one Q4_K / Q6_K matrix. BN tokens per block, S cp.async stages, MB blocks per SM; the
+// shared-memory limit is raised on first use of each instantiation.
+template <int BN, int S, int MB>
+void mmq_launch(const QMat& W, const int8_t* xq, const float* xd, const float* xsd, float* y, int T, int ldy,
+                cudaStream_t s) {
+    using namespace akd::qgemm;
+    const dim3 g((T + BN - 1) / BN, (W.rows + BM - 1) / BM);
+    if (W.type == 1) {
+        static bool init = false;
+        if (!init) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq4<BN, S, MB>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p4_smem_bytes<BN, S>()));
+            init = true;
+        }
+        k_mmq4<BN, S, MB><<<g, NT, p4_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy);
+    } else {
+        static bool init = false;
+        if (!init) {
+            cudaFuncSetAttribute(reinterpret_cast<const void*>(k_mmq6<BN, S, MB>),
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(p6_smem_bytes<BN, S>()));
+            init = true;
+        }
+        k_mmq6<BN, S, MB><<<g, NT, p6_smem_bytes<BN, S>(), s>>>(W.w, xq, xd, xsd, y, W.rows, W.K, T, ldy);
+    }
+}
+
+// Configurations (AK_Q35_MMQ_SHORT for chunks <= 64 tokens, default 0; AK_Q35_MMQ_LONG above, default 2):
+//   0: BN 64, 3 stages, 1 block / SM     1: BN 64, 2 stages, 2 blocks / SM     2: BN 128, 2 stages, 1 block / SM
+// RTX 4060 GEMM ms per chunk (T = 64 / 128 / 256 / 512 / 1024):
+//   0: 49.1 / 77.6 / 149.7 / 288.6 / 560.7   1: 54.8 / 83.9 / 155.0 / 296.4 / 572.4   2: 70.2 / 66.1 / 119.1 / 234.1 / 440.7
+// Tile size (data reuse) matters more than occupancy.
+void mmq_dispatch(const QMat& W, const int8_t* xq, const float* xd, const float* xsd, float* y, int T, int ldy,
+                  int cfg, cudaStream_t s) {
+    if (cfg == 1) mmq_launch<64, 2, 2>(W, xq, xd, xsd, y, T, ldy, s);
+    else if (cfg == 2) mmq_launch<128, 2, 1>(W, xq, xd, xsd, y, T, ldy, s);
+    else mmq_launch<64, 3, 1>(W, xq, xd, xsd, y, T, ldy, s);
+}
+
 // y = A (or [A; B]) x for T columns of b's activations.
 ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a, float* y, int ystride, int T) {
     if (!b.pf) return gemv(A, B, a.q, a.d, y, ystride, T, m->stream);
     auto int8_ok = [&](const QMat& W) { return (W.type == 1 || W.type == 2) && W.K % 256 == 0; };
-    // int8 only pays off on short chunks (see qgemm.cuh); longer ones take the fp16 fused kernel.
-    if (m->int8_gemm && T <= 128 && T <= m->qgemm_max && int8_ok(A) && (!B || (int8_ok(*B) && B->K == A.K))) {
+    // int8 tensor cores (qgemm.cuh) are the fastest path at every chunk length; fp16 fused / cuBLAS otherwise.
+    if (m->int8_gemm && T <= m->int8_max && int8_ok(A) && (!B || (int8_ok(*B) && B->K == A.K))) {
         using namespace akd::qgemm;
         cudaStream_t s = m->stream;
         // quantize the activations once for both matrices
@@ -1285,12 +1327,20 @@ ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a
         for (int i = 0; i < (B ? 2 : 1); ++i) {
             const QMat& W = i ? *B : A;
             float* yy = i ? y + A.rows : y;
-            auto launch = [&](auto kern, int bn) {
-                kern<<<dim3((T + bn - 1) / bn, (W.rows + BM - 1) / BM), NT, 0, s>>>(W.w, m->xq8, m->xd8, m->xsd8, yy,
-                                                                                   W.rows, W.K, T, ystride);
+            auto launch = [&](auto kern, int bn, int bm) {
+                kern<<<dim3((T + bn - 1) / bn, (W.rows + bm - 1) / bm), NT, 0, s>>>(W.w, m->xq8, m->xd8, m->xsd8, yy,
+                                                                                   W.rows, W.K, T, ystride, m->qdiag);
             };
-            if (W.type == 1) launch(k_qgemm8<1, 64>, 64);
-            else launch(k_qgemm8<2, 64>, 64);
+            if (m->qdiag != 2) {  // pipelined cp.async kernels (AK_Q35_QDIAG=2: the plain register-staged ones)
+                const int cfg = T <= 64 ? m->mmq_short : m->mmq_long;
+                mmq_dispatch(W, m->xq8, m->xd8, m->xsd8, yy, T, ystride, cfg, s);
+            } else if (T <= 128) {
+                if (W.type == 1) launch(k_qgemm8<1, 128, 64>, 64, 128);
+                else launch(k_qgemm8<2, 128, 64>, 64, 128);
+            } else {
+                if (W.type == 1) launch(k_qgemm8<1, 128, 128>, 128, 128);
+                else launch(k_qgemm8<2, 128, 128>, 128, 128);
+            }
         }
         return ck(cudaGetLastError());
     }
@@ -1658,6 +1708,14 @@ ak_status ensure_pf(ak_q35_model* m) {
         if (qg) m->qgemm_max = std::atoi(qg);
         const char* i8 = std::getenv("AK_Q35_INT8");
         if (i8) m->int8_gemm = i8[0] != '0';
+        const char* i8m = std::getenv("AK_Q35_INT8_MAX");
+        if (i8m) m->int8_max = std::atoi(i8m);
+        const char* qd = std::getenv("AK_Q35_QDIAG");
+        if (qd) m->qdiag = std::atoi(qd);
+        const char* ms = std::getenv("AK_Q35_MMQ_SHORT");
+        if (ms) m->mmq_short = std::atoi(ms);
+        const char* ml = std::getenv("AK_Q35_MMQ_LONG");
+        if (ml) m->mmq_long = std::atoi(ml);
     }
     {  // int8 activations: the widest K of any prefill matrix (FFN down: ff, MTP eh_proj: 2 d)
         const size_t kmax = std::max<size_t>(m->ff, 2 * static_cast<size_t>(m->d));
@@ -2459,12 +2517,13 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
     return st;
 }
 
-extern "C" ak_status ak_q35_set_int8(ak_q35_model* m, int on) {
+extern "C" ak_status ak_q35_set_int8(ak_q35_model* m, int on, int max_cols) {
     if (!m) {
         ak_set_error("qwen35 set_int8: null model");
         return AK_ERR_INVALID;
     }
     m->int8_gemm = on != 0;
+    m->int8_max = max_cols < 0 ? (1 << 30) : max_cols;
     return AK_OK;
 }
 
