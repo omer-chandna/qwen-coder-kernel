@@ -295,6 +295,10 @@ struct ak_q35_model {
     bool attn_old = false;               // AK_Q35_ATTN_OLD=1: per-column scalar attention kernels
     int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
                                          // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
+    bool int8_gemm = false;              // AK_Q35_INT8=1: chunks of <= 128 tokens on int8 tensor cores (~15% faster,
+                                         // decode-path (Q8_1) accuracy instead of fp16)
+    int8_t* xq8 = nullptr;               // int8 prefill activations [pf_cols][max K]
+    float *xd8 = nullptr, *xsd8 = nullptr;  // their per-32 scales and scale * sum
     int draft_vocab = 0;                 // rows of the LM head the MTP draft scores (a prefix of the vocab)
     __half* w16 = nullptr;               // one matrix expanded to fp16 (prefill)
     size_t w16_n = 0;
@@ -1271,6 +1275,25 @@ Act act_fq(const Bufs& b) { return b.pf ? Act{nullptr, nullptr, b.a16} : Act{b.f
 // y = A (or [A; B]) x for T columns of b's activations.
 ak_status mm(ak_q35_model* m, const Bufs& b, const QMat& A, const QMat* B, Act a, float* y, int ystride, int T) {
     if (!b.pf) return gemv(A, B, a.q, a.d, y, ystride, T, m->stream);
+    auto int8_ok = [&](const QMat& W) { return (W.type == 1 || W.type == 2) && W.K % 256 == 0; };
+    // int8 only pays off on short chunks (see qgemm.cuh); longer ones take the fp16 fused kernel.
+    if (m->int8_gemm && T <= 128 && T <= m->qgemm_max && int8_ok(A) && (!B || (int8_ok(*B) && B->K == A.K))) {
+        using namespace akd::qgemm;
+        cudaStream_t s = m->stream;
+        // quantize the activations once for both matrices
+        k_quant_x8<<<dim3(A.K / 256, T), 256, 0, s>>>(a.h, A.K, m->xq8, m->xd8, m->xsd8);
+        for (int i = 0; i < (B ? 2 : 1); ++i) {
+            const QMat& W = i ? *B : A;
+            float* yy = i ? y + A.rows : y;
+            auto launch = [&](auto kern, int bn) {
+                kern<<<dim3((T + bn - 1) / bn, (W.rows + BM - 1) / BM), NT, 0, s>>>(W.w, m->xq8, m->xd8, m->xsd8, yy,
+                                                                                   W.rows, W.K, T, ystride);
+            };
+            if (W.type == 1) launch(k_qgemm8<1, 64>, 64);
+            else launch(k_qgemm8<2, 64>, 64);
+        }
+        return ck(cudaGetLastError());
+    }
     ak_status st = pf_gemm(m, A, a.h, T, y, ystride);
     if (st == AK_OK && B) st = pf_gemm(m, *B, a.h, T, y + A.rows, ystride);
     return st;
@@ -1633,6 +1656,14 @@ ak_status ensure_pf(ak_q35_model* m) {
     {
         const char* qg = std::getenv("AK_Q35_QGEMM_MAX");
         if (qg) m->qgemm_max = std::atoi(qg);
+        const char* i8 = std::getenv("AK_Q35_INT8");
+        if (i8) m->int8_gemm = i8[0] != '0';
+    }
+    {  // int8 activations: the widest K of any prefill matrix (FFN down: ff, MTP eh_proj: 2 d)
+        const size_t kmax = std::max<size_t>(m->ff, 2 * static_cast<size_t>(m->d));
+        if (st == AK_OK) st = dalloc_n(m, &m->xq8, kmax * cols);
+        if (st == AK_OK) st = dalloc_n(m, &m->xd8, kmax / 32 * cols);
+        if (st == AK_OK) st = dalloc_n(m, &m->xsd8, kmax / 32 * cols);
     }
     if (st == AK_OK) st = ck(cudaHostAlloc(reinterpret_cast<void**>(&m->h_pf), sizeof(int) * 2 * cols, 0));
     Bufs b;
@@ -2426,6 +2457,15 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
     m->graphs.clear();
     m->attn_old = !tensor_core;
     return st;
+}
+
+extern "C" ak_status ak_q35_set_int8(ak_q35_model* m, int on) {
+    if (!m) {
+        ak_set_error("qwen35 set_int8: null model");
+        return AK_ERR_INVALID;
+    }
+    m->int8_gemm = on != 0;
+    return AK_OK;
 }
 
 extern "C" ak_status ak_q35_set_qgemm(ak_q35_model* m, int max_cols) {

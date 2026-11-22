@@ -450,6 +450,9 @@ AK_API ak_status ak_q35_set_attn(ak_q35_model* model, int tensor_core);
 /* Prefill chunks of up to max_cols tokens use the fused quantized-weight GEMM, longer ones fp16 expansion + cuBLAS
    (0: always cuBLAS, < 0: always fused). Also AK_Q35_QGEMM_MAX. */
 AK_API ak_status ak_q35_set_qgemm(ak_q35_model* model, int max_cols);
+/* Prefill chunks of <= 128 tokens: 1 int8 tensor cores with per-32 int8 activations (the decode path's arithmetic,
+   ~15% faster), 0 (default) the fp16 fused kernel. Also AK_Q35_INT8. */
+AK_API ak_status ak_q35_set_int8(ak_q35_model* model, int on);
 /* Logits after the last prompt token. */
 AK_API ak_status ak_q35_logits(ak_q35_model* model, const int32_t* prompt, int n_prompt, int use_graph,
                                float* logits);

@@ -222,12 +222,37 @@ overlapped across tiles.
 I also tried fp16 accumulation in cuBLAS (2x tensor rate on GeForce). It cut GEMM time per 512-token chunk only from
 350 to 282 ms, and greedy output diverged after 55 tokens on one of three prompts. Not adopted.
 
+## int8 tensor cores (`k_qgemm8`, opt-in)
+
+The same fused kernel with integer arithmetic:
+- Activations are quantized to int8 per 32 values (scale and scaled sum), the decode path's Q8_1 scheme.
+- Q4_K nibbles are masked straight into int8 lanes; Q6_K becomes q - 32 via `__vsub4`.
+- `mma.m16n8k32.s8` runs per Q4_K sub-block and `mma.m16n8k16.s8` per Q6_K 16-group, followed by
+  `acc += d*sc*xd*dot - dmin*m*xsd`.
+
+It is correct (logit correlation 0.9994 against cuBLAS, the same as the GEMV prefill path), but barely faster.
+For every 32 values each output needs an int-to-float conversion and the weight and activation scales, and that
+scalar work, not the tensor cores, bounds it. The 128-token tile also needs ~186 registers (one block per SM), or
+spills when capped at 128.
+
+GEMM ms per chunk, fp16 fused -> int8:
+
+| T = 32 | 64 | 128 | 512 |
+|---|---|---|---|
+| 58.5 -> 49.6 | 60.1 -> 52.8 | 98.6 -> 86.7 | 310 -> 457 |
+
+It stays opt-in for chunks of up to 128 tokens (`set_int8(True)` / `AK_Q35_INT8=1`). Capping the fp16 kernels at
+128 registers (two blocks per SM) and removing a runtime-indexed register array that sat in local memory took the
+fp16 path a little further. Measured by `benchmarks/followup.py`:
+- First turn: 4.99 s.
+- Follow-ups of 346 / 774 / 1421 tokens: 0.37 / 0.75 / 1.45 s.
+
 ## Next
 
-- **int8 tensor cores for the matrix products.** This is where llama.cpp's 2x prefill lead comes from. On Ada
-  GeForce, int8 mma runs at about 4x the rate of fp16 with fp32 accumulate. The fused kernel's structure carries
-  over: decode the nibbles to int8 instead of fp16, quantize activations to int8 per 32 values (as the decode path
-  already does), run `mma.m16n8k32.s8`, and apply the Q4_K scale/min per 32-wide sub-block.
+- **int8 that actually wins** needs integer accumulation across scale blocks, so the float rescale happens once per
+  super-block instead of once per 32 values. That means per-256 activation scales, which needs an accuracy check, or
+  folding the 6-bit sub-block scales into the integer sums. It also needs a deeper cp.async pipeline, so that weight
+  loads for later tiles are in flight while the current one is decoded and multiplied.
 - `k_attn_mma` (47% of a chunk at 32k): cp.async double-buffering of the K/V tiles, `ldmatrix` fragment loads and
   more warps per block. Only one 4-warp block fits per SM today.
 - 8-bit KV cache: halves the bytes decode reads per pass at long context, and fits 64k+ contexts in 8 GB.

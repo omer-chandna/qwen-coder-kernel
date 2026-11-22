@@ -203,3 +203,19 @@ def test_fused_quantized_gemm_matches_cublas(model):
     for a, b in ((ref, fused), (short_ref, short)):
         assert int(np.argmax(a)) == int(np.argmax(b))
         assert np.corrcoef(a, b)[0, 1] > 0.9999
+
+
+def test_int8_gemm_matches_reference(model):
+    """Opt-in int8 tensor-core GEMM (chunks <= 128 tokens) against fp16 expansion + cuBLAS: Q8_1-level agreement."""
+    ids = tokenize(MODEL, _long_prompt())[:120]  # one 120-token prefill chunk
+    try:
+        model.set_qgemm(0)
+        ref = model.logits(ids)
+        model.set_qgemm(768)
+        model.set_int8(True)
+        got = model.logits(ids)
+    finally:
+        model.set_int8(False)
+        model.set_qgemm(768)
+    assert int(np.argmax(ref)) == int(np.argmax(got))
+    assert np.corrcoef(ref, got)[0, 1] > 0.999
