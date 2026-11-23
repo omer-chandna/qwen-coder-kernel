@@ -257,6 +257,10 @@ struct Layer {
     const float* k_norm = nullptr;
     __half* kc = nullptr;  // [max_seq][Hkv][hd]
     __half* vc = nullptr;
+    int8_t* kq = nullptr;  // 8-bit KV cache (kv8): [max_seq][Hkv][hd] int8 + [max_seq][Hkv][hd / 32] fp16 scales
+    int8_t* vq = nullptr;
+    __half* ks = nullptr;
+    __half* vs = nullptr;
     // FFN
     QMat wgate, wup, wdown;
 };
@@ -326,6 +330,7 @@ struct ak_q35_model {
     bool no_pf = false;                  // GEMV-only prefill (ak_q35_set_prefill 0, or AK_Q35_NO_PF=1)
     int attn = 2;                        // attention kernels: 0 per-column scalar, 1 k_attn_mma, 2 k_attn_mma2
                                          // (AK_Q35_ATTN; AK_Q35_ATTN_OLD=1 is 0)
+    bool kv8 = false;                    // 8-bit KV cache (AK_Q35_KV8=1); needs attn == 2
     int qgemm_max = 768;                 // prefill chunks up to this many columns use the fused quantized GEMM
                                          // (AK_Q35_QGEMM_MAX; 0 = always dequant + cuBLAS)
     bool int8_gemm = true;               // prefill GEMMs on int8 tensor cores with Q8_1 activations, the decode path's
@@ -733,13 +738,27 @@ __global__ void __launch_bounds__(128) k_gated_norm(const float* o, const float*
     quant32(y, o16 ? nullptr : xq + c * n, o16 ? nullptr : xd + c * n / 32, o16 ? o16 + c * n : nullptr, h * kDk + t);
 }
 
+// 8-bit KV cache (kv8, see k_attn_mma2): int8 + one fp16 scale per 32 dims.
+// One warp, lanes holding dims lane + 32 j of one head vector (k_attn_prep's layout): quantize block j.
+// off: element offset of the head vector in q (a multiple of 256).
+__device__ __forceinline__ void kv8_store(float v, int8_t* q, __half* sc, size_t off, int j) {
+    const float amax = akd::qg_warp_max(fabsf(v));
+    const __half dh = __float2half(amax / 127.f);
+    const float d = __half2float(dh);
+    const int lane = threadIdx.x & 31;
+    q[off + lane + 32 * j] = static_cast<int8_t>(d > 0.f ? max(-127, min(127, __float2int_rn(v / d))) : 0);
+    if (lane == 0) sc[off / 32 + j] = dh;
+}
+
 // q/k RMSNorm per head, NeoX RoPE on the first n_rot dims, k and v appended to the fp16 cache at *pos + c.
 // One warp per head (Hq query heads then Hkv key heads), lanes hold dims lane + 32 j. grid (heads / 8, T).
 // qk columns (qk_stride apart): [Hq x (q 256 | gate 256) | Hkv x k 256]. q is written compact to qout [c][Hq][256].
 __global__ void __launch_bounds__(256) k_attn_prep(const float* qk, int qk_stride, const float* vin, const float* qw,
                                                    const float* kw, float* qout, __half* kc, __half* vc,
                                                    const int* pos_p, int Hq, int Hkv, float eps, float theta,
-                                                   int n_rot, int max_seq) {
+                                                   int n_rot, int max_seq, int8_t* kq = nullptr,
+                                                   int8_t* vq = nullptr, __half* ks = nullptr,
+                                                   __half* vs = nullptr) {
     const int lane = threadIdx.x & 31;
     const int head = blockIdx.x * 8 + (threadIdx.x >> 5);
     const int c = blockIdx.y;
@@ -777,10 +796,18 @@ __global__ void __launch_bounds__(256) k_attn_prep(const float* qk, int qk_strid
     } else if (pos < max_seq) {
         const size_t off = (static_cast<size_t>(pos) * Hkv + hh) * kHd;
         const float* vsrc = vin + (static_cast<size_t>(c) * Hkv + hh) * kHd;
+        if (kq) {  // 8-bit cache (warp-uniform)
 #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            kc[off + lane + 32 * j] = __float2half(vals[j]);
-            vc[off + lane + 32 * j] = __float2half(vsrc[lane + 32 * j]);
+            for (int j = 0; j < 8; ++j) {
+                kv8_store(vals[j], kq, ks, off, j);
+                kv8_store(vsrc[lane + 32 * j], vq, vs, off, j);
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                kc[off + lane + 32 * j] = __float2half(vals[j]);
+                vc[off + lane + 32 * j] = __float2half(vsrc[lane + 32 * j]);
+            }
         }
     }
 }
@@ -1276,14 +1303,94 @@ __device__ __forceinline__ void attn_tile_async(__half* dst, const __half* src, 
     }
 }
 
-template <int NR, bool SPLIT>
-__global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half* kc, const __half* vc, const float* qk,
+// ------------------------------------------------------------------------------------------------
+// 8-bit KV cache (AK_Q35_KV8, docs/KV8_PLAN.md). Each 256-dim K or V head vector is stored as int8 plus one fp16
+// scale per 32 dims (Q8_0-style): kq [max_seq][Hkv][256] int8, ks [max_seq][Hkv][8] fp16, 272 bytes instead of 512.
+// Values are quantized once when written (kv8_store) and every reader dequantizes the same way (half(q) * scale in
+// fp16), so prefill, decode and verify all see identical keys and speculative output still equals greedy.
+// k_attn_mma2<.., KV8 = true> copies int8 tiles + scales into a staging area with cp.async and converts them into the
+// usual fp16 Ks / Vs tiles in shared memory, so the ldmatrix / mma code is unchanged.
+// ------------------------------------------------------------------------------------------------
+
+constexpr int kKv8Blk = kHd / 32;                                                 // scales per head vector
+constexpr size_t kKv8Stage = static_cast<size_t>(kAttnBK) * (kHd + kKv8Blk * 2);  // bytes per staged tile
+constexpr size_t kAttnSmemKv8 = kAttnSmem + 2 * kKv8Stage;
+
+
+// Dequantize 4 int8 (one 32-bit word) -> 2 half2, exactly: (x ^ 0x80) is x + 128 as a byte; 0x6400 | byte is the
+// half 1024 + byte, so subtracting 1152 gives x. Then * scale (one fp16 rounding, the same in every reader).
+__device__ __forceinline__ void kv8_cvt4(uint32_t w, __half2 sc, __half2* out) {
+    w ^= 0x80808080u;
+    const uint32_t lo = __byte_perm(w, 0x64646464u, 0x5140);
+    const uint32_t hi = __byte_perm(w, 0x64646464u, 0x7362);
+    const __half2 bias = __float2half2_rn(1152.f);
+    out[0] = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&lo), bias), sc);
+    out[1] = __hmul2(__hsub2(*reinterpret_cast<const __half2*>(&hi), bias), sc);
+}
+
+__device__ __forceinline__ void attn_cp16b(void* smem, const void* gmem, bool valid) {
+    const unsigned s = static_cast<unsigned>(__cvta_generic_to_shared(smem));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(s), "l"(gmem), "r"(valid ? 16 : 0) : "memory");
+}
+
+// One 32-key int8 tile + its scales -> staging (int8 [32][256], then fp16 scales [32][8]). Rows >= k_end are
+// zero-filled: q = 0 and scale = 0 dequantize to 0, as in the fp16 path.
+__device__ __forceinline__ void attn_tile8_async(unsigned char* st, const int8_t* srcq, const __half* srcs, int kt,
+                                                 int k_end, int Hkv, int g) {
+#pragma unroll
+    for (int j = 0; j < kAttnBK * (kHd / 16) / 128; ++j) {
+        const int i = threadIdx.x + j * 128;
+        const int kr = i / (kHd / 16);
+        const int d16 = (i - kr * (kHd / 16)) * 16;
+        const int t = kt + kr;
+        const bool ok = t < k_end;
+        attn_cp16b(st + kr * kHd + d16, srcq + (static_cast<size_t>(ok ? t : 0) * Hkv + g) * kHd + d16, ok);
+    }
+    if (threadIdx.x < kAttnBK) {
+        const int t = kt + threadIdx.x;
+        const bool ok = t < k_end;
+        attn_cp16b(st + kAttnBK * kHd + threadIdx.x * (kKv8Blk * 2),
+                   srcs + (static_cast<size_t>(ok ? t : 0) * Hkv + g) * kKv8Blk, ok);
+    }
+}
+
+// Staging -> fp16 tile (row stride kAttnLd). Each thread converts 16 values per step.
+__device__ __forceinline__ void attn_tile8_cvt(__half* dst, const unsigned char* st) {
+    const __half* sc = reinterpret_cast<const __half*>(st + kAttnBK * kHd);
+#pragma unroll
+    for (int j = 0; j < kAttnBK * (kHd / 16) / 128; ++j) {
+        const int i = threadIdx.x + j * 128;
+        const int kr = i / (kHd / 16);
+        const int d16 = (i - kr * (kHd / 16)) * 16;
+        const uint4 w = *reinterpret_cast<const uint4*>(st + kr * kHd + d16);
+        const __half2 s2 = __half2half2(sc[kr * kKv8Blk + d16 / 32]);
+        __half2 h[8];
+        kv8_cvt4(w.x, s2, h);
+        kv8_cvt4(w.y, s2, h + 2);
+        kv8_cvt4(w.z, s2, h + 4);
+        kv8_cvt4(w.w, s2, h + 6);
+        uint4* o = reinterpret_cast<uint4*>(dst + kr * kAttnLd + d16);
+        o[0] = *reinterpret_cast<const uint4*>(h);
+        o[1] = *reinterpret_cast<const uint4*>(h + 4);
+    }
+}
+
+// KV8: kc_ / vc_ are the int8 caches and ksc / vsc their scales (see kv8_store); otherwise the fp16 caches.
+template <int NR, bool SPLIT, bool KV8 = false>
+__global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const void* kc_, const void* vc_, const float* qk,
                                                    int qk_stride, __half* o16, float* part, const int* pos_p, int Hkv,
-                                                   int T, int n_split, int max_seq) {
+                                                   int T, int n_split, int max_seq, const __half* ksc = nullptr,
+                                                   const __half* vsc = nullptr) {
     extern __shared__ __align__(16) unsigned char attn_smem[];
     __half* Qs = reinterpret_cast<__half*>(attn_smem);
     __half* Ks = Qs + kAttnRows * kAttnLd;
     __half* Vs = Ks + kAttnBK * kAttnLd;
+    unsigned char* Kst = reinterpret_cast<unsigned char*>(Vs + kAttnBK * kAttnLd);  // KV8 staging
+    unsigned char* Vst = Kst + kKv8Stage;
+    const __half* kc = static_cast<const __half*>(kc_);
+    const __half* vc = static_cast<const __half*>(vc_);
+    const int8_t* kq8 = static_cast<const int8_t*>(kc_);
+    const int8_t* vq8 = static_cast<const int8_t*>(vc_);
     const int g = blockIdx.x;
     const int split = SPLIT ? static_cast<int>(blockIdx.y) : 0;
     const int tile = SPLIT ? blockIdx.z : blockIdx.y;
@@ -1305,7 +1412,8 @@ __global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half*
     const int gq = lane >> 2;
     const int tig = lane & 3;
 
-    attn_tile_async(Ks, kc, k_begin, k_end, Hkv, g);  // first K tile in flight while Q is converted
+    if (KV8) attn_tile8_async(Kst, kq8, ksc, k_begin, k_end, Hkv, g);
+    else attn_tile_async(Ks, kc, k_begin, k_end, Hkv, g);  // first K tile in flight while Q is converted
     attn_cp_commit();
     for (int i = threadIdx.x; i < kAttnRows * (kHd / 2); i += blockDim.x) {
         const int r = i / (kHd / 2);
@@ -1341,8 +1449,15 @@ __global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half*
     for (int kt = k_begin; kt < k_end; kt += kAttnBK) {
         attn_cp_wait_all();
         __syncthreads();  // K(kt) and Q visible; every warp is done with V(kt - BK)
-        attn_tile_async(Vs, vc, kt, k_end, Hkv, g);
-        attn_cp_commit();
+        if (KV8) {
+            attn_tile8_cvt(Ks, Kst);
+            attn_tile8_async(Vst, vq8, vsc, kt, k_end, Hkv, g);
+            attn_cp_commit();
+            __syncthreads();  // fp16 K(kt) visible
+        } else {
+            attn_tile_async(Vs, vc, kt, k_end, Hkv, g);
+            attn_cp_commit();
+        }
 
         float s[4][4];
 #pragma unroll
@@ -1403,8 +1518,15 @@ __global__ void __launch_bounds__(128) k_attn_mma2(const float* q, const __half*
 
         attn_cp_wait_all();
         __syncthreads();  // V(kt) visible; every warp is done with K(kt)
-        if (kt + kAttnBK < k_end) attn_tile_async(Ks, kc, kt + kAttnBK, k_end, Hkv, g);
-        attn_cp_commit();
+        if (KV8) {
+            attn_tile8_cvt(Vs, Vst);
+            if (kt + kAttnBK < k_end) attn_tile8_async(Kst, kq8, ksc, kt + kAttnBK, k_end, Hkv, g);
+            attn_cp_commit();
+            __syncthreads();  // fp16 V(kt) visible
+        } else {
+            if (kt + kAttnBK < k_end) attn_tile_async(Ks, kc, kt + kAttnBK, k_end, Hkv, g);
+            attn_cp_commit();
+        }
 
 #pragma unroll
         for (int kc2 = 0; kc2 < 2; ++kc2) {
@@ -1772,7 +1894,7 @@ ak_status emit_attn(ak_q35_model* m, const Bufs& b, const Layer& L, int T, const
     mark(p, s, kKGemvAttnIn);
     k_attn_prep<<<dim3((m->hq + m->hkv + 7) / 8, T), 256, 0, s>>>(qk, m->big_n, b.v, L.q_norm, L.k_norm, b.q, L.kc,
                                                                   L.vc, pos_p, m->hq, m->hkv, m->eps, m->theta,
-                                                                  m->n_rot, m->max_seq);
+                                                                  m->n_rot, m->max_seq, L.kq, L.vq, L.ks, L.vs);
     mark(p, s, kKAttnPrep);
     const int ratio = m->hq / m->hkv;
     if (m->attn != 0) {
@@ -1781,18 +1903,46 @@ ak_status emit_attn(ak_q35_model* m, const Bufs& b, const Layer& L, int T, const
             kern<<<grid, 128, kAttnSmem, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, m->part, pos_p, m->hkv, T,
                                               m->n_split, m->max_seq);
         };
+        auto launch2 = [&](auto kern, dim3 grid) {
+            kern<<<grid, 128, kAttnSmem, s>>>(b.q, L.kc, L.vc, qk, m->big_n, b.a16, m->part, pos_p, m->hkv, T,
+                                              m->n_split, m->max_seq, nullptr, nullptr);
+        };
+        auto launch8 = [&](auto kern, dim3 grid) {
+            kern<<<grid, 128, kAttnSmemKv8, s>>>(b.q, L.kq, L.vq, qk, m->big_n, b.a16, m->part, pos_p, m->hkv, T,
+                                                 m->n_split, m->max_seq, L.ks, L.vs);
+        };
         const bool v2 = m->attn == 2;
         if (b.pf) {
             const dim3 grid(m->hkv, tiles);
-            if (ratio == 1) launch(v2 ? k_attn_mma2<1, false> : k_attn_mma<1, false>, grid);
-            else if (ratio == 2) launch(v2 ? k_attn_mma2<2, false> : k_attn_mma<2, false>, grid);
-            else launch(v2 ? k_attn_mma2<4, false> : k_attn_mma<4, false>, grid);
+            if (m->kv8) {
+                if (ratio == 1) launch8(k_attn_mma2<1, false, true>, grid);
+                else if (ratio == 2) launch8(k_attn_mma2<2, false, true>, grid);
+                else launch8(k_attn_mma2<4, false, true>, grid);
+            } else if (v2) {
+                if (ratio == 1) launch2(k_attn_mma2<1, false>, grid);
+                else if (ratio == 2) launch2(k_attn_mma2<2, false>, grid);
+                else launch2(k_attn_mma2<4, false>, grid);
+            } else {
+                if (ratio == 1) launch(k_attn_mma<1, false>, grid);
+                else if (ratio == 2) launch(k_attn_mma<2, false>, grid);
+                else launch(k_attn_mma<4, false>, grid);
+            }
             mark(p, s, kKAttnPart);
         } else {
             const dim3 grid(m->hkv, m->n_split, tiles);
-            if (ratio == 1) launch(v2 ? k_attn_mma2<1, true> : k_attn_mma<1, true>, grid);
-            else if (ratio == 2) launch(v2 ? k_attn_mma2<2, true> : k_attn_mma<2, true>, grid);
-            else launch(v2 ? k_attn_mma2<4, true> : k_attn_mma<4, true>, grid);
+            if (m->kv8) {
+                if (ratio == 1) launch8(k_attn_mma2<1, true, true>, grid);
+                else if (ratio == 2) launch8(k_attn_mma2<2, true, true>, grid);
+                else launch8(k_attn_mma2<4, true, true>, grid);
+            } else if (v2) {
+                if (ratio == 1) launch2(k_attn_mma2<1, true>, grid);
+                else if (ratio == 2) launch2(k_attn_mma2<2, true>, grid);
+                else launch2(k_attn_mma2<4, true>, grid);
+            } else {
+                if (ratio == 1) launch(k_attn_mma<1, true>, grid);
+                else if (ratio == 2) launch(k_attn_mma<2, true>, grid);
+                else launch(k_attn_mma<4, true>, grid);
+            }
             mark(p, s, kKAttnPart);
             k_attn_combine<<<dim3(m->hq, T), kHd, 0, s>>>(m->part, qk, m->big_n, b.aq, b.ad, pos_p, m->n_split,
                                                           m->max_seq);
@@ -2390,8 +2540,15 @@ ak_status load_attn(ak_q35_model* m, const Loader& ld, const std::string& p, Lay
     if (st == AK_OK) st = ld.mat(p + "attn_output.weight", m->d, m->hq * kHd, &L.wo);
     if (st == AK_OK) st = ld.vec(p + "attn_q_norm.weight", kHd, &L.q_norm);
     if (st == AK_OK) st = ld.vec(p + "attn_k_norm.weight", kHd, &L.k_norm);
-    if (st == AK_OK) st = dalloc_n(m, &L.kc, kv);
-    if (st == AK_OK) st = dalloc_n(m, &L.vc, kv);
+    if (m->kv8) {
+        if (st == AK_OK) st = dalloc_n(m, &L.kq, kv);
+        if (st == AK_OK) st = dalloc_n(m, &L.vq, kv);
+        if (st == AK_OK) st = dalloc_n(m, &L.ks, kv / 32);
+        if (st == AK_OK) st = dalloc_n(m, &L.vs, kv / 32);
+    } else {
+        if (st == AK_OK) st = dalloc_n(m, &L.kc, kv);
+        if (st == AK_OK) st = dalloc_n(m, &L.vc, kv);
+    }
     return st;
 }
 
@@ -2441,6 +2598,10 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
         return it == f.num.end() ? fb : it->second;
     };
     ak_q35_model* m = new ak_q35_model();
+    {
+        const char* k8 = std::getenv("AK_Q35_KV8");
+        m->kv8 = k8 && k8[0] == '1';
+    }
     const int blocks = static_cast<int>(num("block_count", 0));
     const int nextn = static_cast<int>(num("nextn_predict_layers", 0));
     m->n_layers = blocks - nextn;
@@ -2593,6 +2754,7 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
         if (a && a[0] == '1') m->attn = 0;
         const char* av = std::getenv("AK_Q35_ATTN");
         if (av && av[0] >= '0' && av[0] <= '2') m->attn = av[0] - '0';
+        if (m->kv8) m->attn = 2;  // the 8-bit cache is only read by k_attn_mma2
     }
     // The tensor-core attention kernels need more than the default 48 KB of dynamic shared memory.
     for (const void* f : {reinterpret_cast<const void*>(k_attn_mma<1, false>),
@@ -2609,6 +2771,17 @@ extern "C" ak_status ak_q35_load(const char* path, int max_seq, ak_q35_model** o
                           reinterpret_cast<const void*>(k_attn_mma2<4, true>)}) {
         if (st == AK_OK) {
             st = ck(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kAttnSmem)));
+        }
+    }
+    for (const void* f : {reinterpret_cast<const void*>(k_attn_mma2<1, false, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<2, false, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<4, false, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<1, true, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<2, true, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<4, true, true>)}) {
+        if (st == AK_OK) {
+            st = ck(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         static_cast<int>(kAttnSmemKv8)));
         }
     }
     if (st == AK_OK) st = reset(m);
@@ -3085,6 +3258,10 @@ extern "C" ak_status ak_q35_set_attn(ak_q35_model* m, int tensor_core) {
     }
     const int mode = tensor_core < 0 || tensor_core > 2 ? 2 : tensor_core;
     if (m->attn == mode) return AK_OK;
+    if (m->kv8) {
+        ak_set_error("qwen35 set_attn: the 8-bit KV cache (AK_Q35_KV8) is only read by attention v2");
+        return AK_ERR_UNSUPPORTED;
+    }
     ak_status st = ck(cudaStreamSynchronize(m->stream));
     for (auto& kv : m->graphs) cudaGraphExecDestroy(kv.second);  // captured graphs bake in the kernel choice
     m->graphs.clear();

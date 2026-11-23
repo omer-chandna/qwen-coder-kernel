@@ -29,7 +29,7 @@ namespace {
     } while (0)
 
 constexpr int kHkvB = 4, kNrB = 4, kHqB = kHkvB * kNrB, kSeqB = 40960;
-constexpr int kNSplitB = (kSeqB + kAttnChunk - 1) / kAttnChunk;
+const int kNSplitB = split_count(kSeqB);
 
 template <typename F>
 float time_ms(F&& f, int reps = 20) {
@@ -78,6 +78,19 @@ Cmp compare_f(const float* a, const float* b, size_t n) {
     return c;
 }
 
+// fp16 cache -> int8 + scales via the runtime's kv8_store (one warp per head vector), and the reference dequantize
+// (half(q) * scale, the same single fp16 rounding as attn_tile8_cvt).
+__global__ void k_bench_kv8_quant(const __half* src, int8_t* q, __half* sc, size_t n_vec) {
+    const size_t v = (static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+    if (v >= n_vec) return;
+    const int lane = threadIdx.x & 31;
+    for (int j = 0; j < 8; ++j) kv8_store(__half2float(src[v * kHd + lane + 32 * j]), q, sc, v * kHd, j);
+}
+__global__ void k_bench_kv8_deq(const int8_t* q, const __half* sc, __half* out, size_t n) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __hmul(__int2half_rn(q[i]), sc[i / 32]);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -87,6 +100,10 @@ int main(int argc, char** argv) {
                           reinterpret_cast<const void*>(k_attn_mma2<4, false>),
                           reinterpret_cast<const void*>(k_attn_mma2<4, true>)}) {
         CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kAttnSmem)));
+    }
+    for (const void* f : {reinterpret_cast<const void*>(k_attn_mma2<4, false, true>),
+                          reinterpret_cast<const void*>(k_attn_mma2<4, true, true>)}) {
+        CK(cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kAttnSmemKv8)));
     }
     const int max_t = 1024;
     const int qk_stride = kHqB * 2 * kHd;
@@ -138,11 +155,19 @@ int main(int argc, char** argv) {
         const dim3 grid = pf ? dim3(kHkvB, tiles) : dim3(kHkvB, kNSplitB, tiles);
         auto run = [&](int v) {
             if (pf) {
-                (v == 1 ? k_attn_mma<4, false> : k_attn_mma2<4, false>)<<<grid, 128, kAttnSmem>>>(
-                    q, kc, vc, qk, qk_stride, v == 1 ? o1 : o2, nullptr, pos_d, kHkvB, cs.T, kNSplitB, kSeqB);
+                if (v == 1)
+                    k_attn_mma<4, false><<<grid, 128, kAttnSmem>>>(q, kc, vc, qk, qk_stride, o1, nullptr, pos_d, kHkvB,
+                                                                   cs.T, kNSplitB, kSeqB);
+                else
+                    k_attn_mma2<4, false><<<grid, 128, kAttnSmem>>>(q, kc, vc, qk, qk_stride, o2, nullptr, pos_d, kHkvB,
+                                                                    cs.T, kNSplitB, kSeqB);
             } else {
-                (v == 1 ? k_attn_mma<4, true> : k_attn_mma2<4, true>)<<<grid, 128, kAttnSmem>>>(
-                    q, kc, vc, qk, qk_stride, nullptr, v == 1 ? p1 : p2, pos_d, kHkvB, cs.T, kNSplitB, kSeqB);
+                if (v == 1)
+                    k_attn_mma<4, true><<<grid, 128, kAttnSmem>>>(q, kc, vc, qk, qk_stride, nullptr, p1, pos_d, kHkvB,
+                                                                  cs.T, kNSplitB, kSeqB);
+                else
+                    k_attn_mma2<4, true><<<grid, 128, kAttnSmem>>>(q, kc, vc, qk, qk_stride, nullptr, p2, pos_d, kHkvB,
+                                                                   cs.T, kNSplitB, kSeqB);
             }
             CK(cudaGetLastError());
         };
@@ -160,5 +185,79 @@ int main(int argc, char** argv) {
                     c.same ? "yes" : "NO", c.max_diff);
     }
     std::printf(all_same ? "all outputs bit-identical\n" : "OUTPUTS DIFFER\n");
+
+    // ---- 8-bit KV cache: v2 KV8 vs v2 fp16 on the dequantized cache (must be bit-identical), and vs fp16 v2 on
+    // the original cache (the quantization error), plus timing.
+    int8_t *kq, *vq;
+    __half *ksc, *vsc, *kd, *vd;
+    const size_t n_vec = kv_n / kHd;
+    CK(cudaMalloc(&kq, kv_n));
+    CK(cudaMalloc(&vq, kv_n));
+    CK(cudaMalloc(&ksc, n_vec * 8 * sizeof(__half)));
+    CK(cudaMalloc(&vsc, n_vec * 8 * sizeof(__half)));
+    CK(cudaMalloc(&kd, kv_n * sizeof(__half)));
+    CK(cudaMalloc(&vd, kv_n * sizeof(__half)));
+    const unsigned qb = static_cast<unsigned>((n_vec * 32 + 255) / 256), db = static_cast<unsigned>((kv_n + 255) / 256);
+    k_bench_kv8_quant<<<qb, 256>>>(kc, kq, ksc, n_vec);
+    k_bench_kv8_quant<<<qb, 256>>>(vc, vq, vsc, n_vec);
+    k_bench_kv8_deq<<<db, 256>>>(kq, ksc, kd, kv_n);
+    k_bench_kv8_deq<<<db, 256>>>(vq, vsc, vd, kv_n);
+    CK(cudaGetLastError());
+    __half* o3;
+    float* p3;
+    CK(cudaMalloc(&o3, o_n * sizeof(__half)));
+    CK(cudaMalloc(&p3, part_n * sizeof(float)));
+    std::printf("\nKV8:  %-6s %-6s | %-9s %-9s %-7s | %-6s %-9s | %s\n", "T", "pos", "fp16 ms", "kv8 ms", "speedup",
+                "same", "max|diff|", "vs original fp16 cache: max|diff|");
+    bool kv8_same = true;
+    idx = 0;
+    for (const Case& cs : cases) {
+        if (only >= 0 && idx++ != only) continue;
+        CK(cudaMemcpy(pos_d, &cs.pos, sizeof(int), cudaMemcpyHostToDevice));
+        const bool pf = cs.T > kMaxCols;
+        const int tiles = (cs.T * kNrB + kAttnRows - 1) / kAttnRows;
+        const dim3 grid = pf ? dim3(kHkvB, tiles) : dim3(kHkvB, kNSplitB, tiles);
+        // mode 0: fp16 v2 on the original cache, 1: fp16 v2 on the dequantized cache, 2: KV8
+        auto run = [&](int mode) {
+            __half* o = mode == 0 ? o1 : mode == 1 ? o2 : o3;
+            float* pp = mode == 0 ? p1 : mode == 1 ? p2 : p3;
+            const void* K = mode == 0 ? static_cast<const void*>(kc) : mode == 1 ? static_cast<const void*>(kd) : kq;
+            const void* V = mode == 0 ? static_cast<const void*>(vc) : mode == 1 ? static_cast<const void*>(vd) : vq;
+            if (pf) {
+                if (mode == 2)
+                    k_attn_mma2<4, false, true><<<grid, 128, kAttnSmemKv8>>>(q, K, V, qk, qk_stride, o, nullptr, pos_d,
+                                                                           kHkvB, cs.T, kNSplitB, kSeqB, ksc, vsc);
+                else
+                    k_attn_mma2<4, false><<<grid, 128, kAttnSmem>>>(q, K, V, qk, qk_stride, o, nullptr, pos_d, kHkvB,
+                                                                    cs.T, kNSplitB, kSeqB);
+            } else {
+                if (mode == 2)
+                    k_attn_mma2<4, true, true><<<grid, 128, kAttnSmemKv8>>>(q, K, V, qk, qk_stride, nullptr, pp, pos_d,
+                                                                          kHkvB, cs.T, kNSplitB, kSeqB, ksc, vsc);
+                else
+                    k_attn_mma2<4, true><<<grid, 128, kAttnSmem>>>(q, K, V, qk, qk_stride, nullptr, pp, pos_d, kHkvB,
+                                                                   cs.T, kNSplitB, kSeqB);
+            }
+            CK(cudaGetLastError());
+        };
+        CK(cudaMemset(p1, 0, part_n * sizeof(float)));
+        CK(cudaMemset(p2, 0, part_n * sizeof(float)));
+        CK(cudaMemset(p3, 0, part_n * sizeof(float)));
+        run(0);
+        run(1);
+        run(2);
+        CK(cudaDeviceSynchronize());
+        const size_t n = pf ? static_cast<size_t>(cs.T) * kHqB * kHd
+                            : static_cast<size_t>(cs.T) * kHqB * kNSplitB * (kHd + 2);
+        const Cmp c = pf ? compare_h(o2, o3, n) : compare_f(p2, p3, n);
+        const Cmp e = pf ? compare_h(o1, o3, n) : compare_f(p1, p3, n);
+        kv8_same = kv8_same && c.same;
+        const float t0 = time_ms([&] { run(0); });
+        const float t2 = time_ms([&] { run(2); });
+        std::printf("      %-6d %-6d | %-9.3f %-9.3f %-7.2f | %-6s %-9.3g | %.3g\n", cs.T, cs.pos, t0, t2, t0 / t2,
+                    c.same ? "yes" : "NO", c.max_diff, e.max_diff);
+    }
+    std::printf(kv8_same ? "KV8 bit-identical to fp16 attention on the dequantized cache\n" : "KV8 OUTPUTS DIFFER\n");
+    all_same = all_same && kv8_same;
     return all_same ? 0 : 2;
 }

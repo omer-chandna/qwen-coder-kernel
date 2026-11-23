@@ -24,9 +24,11 @@ were true when they were written. This summary gives the current numbers and a m
 | First agent turn, 6k-token prompt from cold (`benchmarks/chunk_profile.py`) | ~3.3 s (~1830 tok/s; llama.cpp ~2230) |
 | Follow-up turns, 50 / 148 / 375 / 748 / 1446 new tokens | 0.05 / 0.13 / 0.21 / 0.41 / 0.88 s |
 | 512-token prefill chunk at position 0 | 247 ms: int8 GEMMs 214, delta rule 16, rest 13, attention 3.5 |
+| Context that fits in 8 GB | 40,960 (fp16 KV cache, default); 81,920 with the opt-in 8-bit KV cache (`--kv8`) |
 
 Output is bit-identical to greedy decoding (speculative output == greedy, asserted in the tests). All 26 tests
-pass, and greedy output matches llama.cpp for 64 tokens on 6 of 6 prompts (`benchmarks/llama_match.py`).
+pass, and greedy output matches llama.cpp for 64 tokens on 6 of 6 prompts (`benchmarks/llama_match.py`). With
+`AK_Q35_KV8=1` see "8-bit KV cache" for what changes.
 
 **Where the time goes, and what is left.**
 - **Decode** of MTP-drafted output runs within ~10% of the card's memory-bandwidth limit (4.9 GB of weights per
@@ -50,6 +52,7 @@ pass, and greedy output matches llama.cpp for 64 tokens on 6 of 6 prompts (`benc
 | Draft policy v2 | acceptance depends on n-gram match length; an agreement gate against bad lookups |
 | Fused FFN gate + up + SiLU | removes a 100 MB-per-layer round trip (small net gain) |
 | Split attention | slices tiered by key position, so decode and verify still merge identically |
+| 8-bit KV cache | opt-in int8 attention cache: context 40k -> 80k in 8 GB, logits corr ~0.9995, speed unchanged |
 | Profiling the int8 GEMM | Nsight Compute: issue-bound with 2 warps per scheduler, plus Q6_K bank conflicts and copy overhead: Q6_K -30% |
 | Next | what is left, what each item would buy, and why it was not done |
 
@@ -930,6 +933,51 @@ remaining limit is the per-sub-block float epilogue (~15 issue slots per IMMA) w
 hide latency. More warps need fewer registers and less shared memory per block at once, a larger redesign (for example
 warp-specialized loading), and the 16-warp experiment shows the barrier cost then grows.
 
+## 8-bit KV cache (opt-in: `AK_Q35_KV8=1`, `serve --kv8`, `serve.ps1 -Kv8`)
+
+The full-attention cache (8 layers + the MTP block, 4 KV heads x 256 dims, K and V) was fp16: ~36 KB per token,
+1.4 GB at 40k. It can now be stored Q8_0-style, int8 plus one fp16 scale per 32 values: 272 bytes per head vector
+instead of 512 (-47%). Model weights are unchanged.
+
+- **Write:** `k_attn_prep` quantizes K (after norm and RoPE) and V once, with a warp absmax per 32 dims
+  (`kv8_store`). The scale is rounded to fp16 before quantizing, so the stored pair is exactly what readers use.
+- **Read:** `k_attn_mma2<NR, SPLIT, KV8 = true>`. `cp.async` cannot convert, so each 32-key tile goes int8 + scales
+  -> a staging area (8.7 KB per operand, shared memory 66 -> 83 KB), then every thread converts 16 values to the
+  usual fp16 `Ks` / `Vs` tile (exact int8 -> fp16 via `__byte_perm` into `0x64xx` and a subtract, then one `__hmul2`
+  by the scale), then the unchanged `ldmatrix` / mma code. Two extra barriers per tile. The staggered pipeline is
+  kept: V(t) is copied during S, K(t+1) during PV.
+- Every pass (prefill, decode, verify, MTP) reads the same dequantized values, so speculative output still equals
+  greedy. Only v2 reads the int8 cache: with KV8 the runtime forces `attn = 2` and `set_attention(0 | 1)` returns
+  an error; the three tests comparing the older kernels are skipped under `AK_Q35_KV8=1`.
+
+**Kernel bench** (`scripts\cuda_bench.ps1 -Bench attn`, random data, 4 KV heads): KV8 output is bit-identical to
+fp16 v2 on the dequantized cache in all 10 cases. Time against fp16 v2: decode at 32k 0.575 -> 0.464 ms (1.24x),
+verify (12 columns) 0.630 -> 0.518 ms, prefill 512 columns 0-5% slower (12.9 -> 13.5 ms at 32k; the conversion
+and barriers are not hidden).
+
+**Model** (`benchmarks/kv8_compare.py`, ctx 40960, prompts from this repo's sources):
+
+| prompt | logits corr (KV8 vs fp16) | top-1 / top-5 | max \|logit diff\| | prefill fp16 -> KV8 |
+|---|---|---|---|---|
+| 4,040 | 0.99944 | same / 5 of 5 | 0.41 | 2.24 -> 2.23 s |
+| 16,040 | 0.99952 | same / 5 of 5 | 0.47 | 9.68 -> 9.67 s |
+| 32,039 | 0.99962 | same / 5 of 5 | 0.29 | 21.09 -> 21.11 s |
+
+- VRAM at ctx 40960: 6504 -> 5829 MB. With KV8, ctx 65536 loads at 6290 MB and ctx 81920 at 6598 MB; a 78,040-token
+  prompt at 81920 read in 65 s, decoded at 57 tok/s and gave a sensible answer, with 7.6 GB of the card in use
+  (desktop apps included). fp16 at 81920 does not fit.
+- Decode at 32k (`chunk_profile --pos 32000`, three interleaved runs): attention 4.8 -> 4.26 ms per step, ~2%
+  of the step, not the ~9% estimated beforehand. The estimate counted the whole cache read as attention time; the
+  rest of the attention group (prep, combine, gate) is unchanged.
+- `llama_match`: 1327 / 1351 characters agree (fp16: 1351). One prompt diverges at character 223 of 238.
+- Tests with KV8: 20 pass, 3 skipped (5 cases), and `test_prefix_cache_equals_fresh` fails at turn 2 on a near-tie
+  (21.175 vs 21.152). This is not KV8-specific: resuming from a snapshot and a fresh prefill are not bitwise equal
+  in fp16 either. A 20-turn version of the test mismatched on 2 turns with fp16 and 3 with KV8; the 3-turn test
+  passes with fp16 by luck of where its near-ties fall.
+
+Kept opt-in: the gain is context length, the logit agreement (~0.9995) sits right at the bar the repo uses for
+kernel variants, and it has not yet been used in real agent sessions.
+
 ## Next
 
 Where a 512-token prefill chunk at position 0 goes now (247 ms): int8 GEMMs 214 (87%), delta rule 16, the rest
@@ -943,11 +991,9 @@ at short context and 26.7 at 32k (attention 4.8 ms).
     follow-up steps 3-7% faster.
   - Not done: decoding the reply dominates each agent step, and the obvious route (more warps per block) already
     measured slower in two variants. Worth revisiting for workloads with many long fresh prompts.
-- **8-bit KV cache** (on hold). This quantizes the runtime attention cache, not the model, whose weights are already
-  Q4_K_M. At 32k, decode attention is 18% of a step and already at bandwidth (1.07 GB in 4.8 ms), so int8
-  K / V with per-32 scales would save ~2.4 ms per step (~9%) and double the context that fits in 8 GB (~40k -> ~80k).
-  The cost is a dequantize step in the tensor-core attention kernel (cp.async cannot convert), which would slow
-  long-context prefill attention unless it overlaps with the mma work.
+- **8-bit KV cache follow-ups** (see "8-bit KV cache"): use it in real OpenCode sessions before considering it as a
+  default; decide whether `test_prefix_cache_equals_fresh` should tolerate near-ties (it is not bitwise in fp16
+  either); hide the tile conversion behind the mma work to recover the 0-5% on long-context prefill attention.
 - **Wide verify** is 30.4 ms at 12 columns against a 22 ms floor. The epilogue is no longer the limit (regrouping it
   gained nothing). It must stay bit-identical to the T = 1 decode path.
 - **MTP-drafted decode** (prose, tests) is ~85% target pass at 4-5 columns, within ~10% of the weight-bandwidth floor

@@ -435,11 +435,15 @@ def main() -> None:
     ap.add_argument("--draft-vocab", type=int, default=65536)
     ap.add_argument("--pf-cols", type=int, default=0,
                     help="prompt chunk length (default 1024); 512 saves ~170 MB of VRAM, prompts read ~15%% slower")
+    ap.add_argument("--kv8", action="store_true",
+                    help="8-bit KV cache (int8 + fp16 scale per 32 values): ~47%% less KV memory, larger --ctx")
     args = ap.parse_args()
-    if args.pf_cols:
-        import os
+    import os
 
+    if args.pf_cols:
         os.environ["AK_Q35_PF_COLS"] = str(args.pf_cols)  # read by the runtime on the first long prompt
+    if args.kv8:
+        os.environ["AK_Q35_KV8"] = "1"  # read by the runtime at model load
     Handler.engine = Engine(Path(args.model), args.ctx, args.draft_vocab)
     srv = Server((args.host, args.port), Handler)
     print(f"[serve] OpenAI-compatible API on http://{args.host}:{args.port}/v1  (model id: {MODEL_ID})", flush=True)

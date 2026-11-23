@@ -169,7 +169,9 @@ The server uses port 8090 because OpenCode auto-discovers :8000 as vLLM with too
 
 > [!NOTE]
 > One request at a time, greedy decoding only (temperature is ignored), 40k context by default (peaks at ~7.7 GB on an 8 GB card;
-> `-Ctx 32768 -PfCols 1024` leaves more room for other apps).
+> `-Ctx 32768 -PfCols 1024` leaves more room for other apps). For longer context, `-Kv8` stores the attention cache
+> as int8 (opt-in): `-Ctx 65536 -Kv8` fits comfortably, `-Ctx 81920 -Kv8` is the most that fits; set OpenCode's
+> `limit.context` to match.
 
 ### Tests
 
@@ -188,6 +190,7 @@ to a llama.cpp `build/bin` folder to also check token and greedy-output parity w
 | `python -m benchmarks.chunk_profile` | GPU time per prefill chunk by kernel group, and an agent-session replay (first turn + follow-ups) |
 | `python -m benchmarks.long_context` | prompt reading and decode at 4k-36k context |
 | `python -m benchmarks.llama_match` | how long greedy output agrees with `llama-completion --temp 0` |
+| `python -m benchmarks.kv8_compare` | 8-bit vs fp16 KV cache on 4k-32k prompts: logit agreement, speed, VRAM |
 | `scripts\cuda_bench.ps1 -Bench attn` / `-Bench gemm` | attention or int8 GEMM kernels alone on random data (no model load): bit equality and timing |
 | `scripts\ab_profile.ps1 -A <checkout> -B <checkout>` | interleaved A/B of `chunk_profile` between two builds |
 | `python -m benchmarks.sass_hotspots <sass.csv>` | summarizes an Nsight Compute SASS export (stalls by opcode, bank conflicts) |

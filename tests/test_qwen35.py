@@ -18,6 +18,9 @@ MODEL = Path(os.environ.get("AK_QWEN35_GGUF", DEFAULT))
 
 pytestmark = pytest.mark.skipif(not MODEL.exists(), reason="qwen35 GGUF not present")
 LLAMA_BIN = os.environ.get("LLAMA_CPP_BIN")
+KV8 = os.environ.get("AK_Q35_KV8") == "1"
+# The older attention kernels (scalar, v1) only read the fp16 cache, so the tests comparing them run without KV8.
+fp16_kv_only = pytest.mark.skipif(KV8, reason="compares fp16-cache attention kernels; AK_Q35_KV8=1 is set")
 
 
 @functools.lru_cache(maxsize=1)
@@ -201,6 +204,7 @@ def _long_prompt(n_chars: int = 4800) -> str:
             + "```<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n")
 
 
+@fp16_kv_only
 @pytest.mark.parametrize("batched", [True, False])
 def test_tensor_core_attention_matches_scalar(model, batched):
     """The tiled mma attention (prefill: batched=True; split-key verify path: batched=False, GEMV prefill in
@@ -222,6 +226,7 @@ def test_tensor_core_attention_matches_scalar(model, batched):
     assert np.corrcoef(new, old)[0, 1] > 0.9995
 
 
+@fp16_kv_only
 def test_tensor_core_decode_matches_scalar(model):
     ids = tokenize(MODEL, _long_prompt())
     new = model.generate(ids, 48)["tokens"]
@@ -234,6 +239,7 @@ def test_tensor_core_decode_matches_scalar(model):
     assert same >= 40, f"tensor-core and scalar decode diverge at token {same}"
 
 
+@fp16_kv_only
 @pytest.mark.parametrize("batched", [True, False])
 def test_attention_v2_matches_v1(model, batched):
     """k_attn_mma2 keeps k_attn_mma's mma and softmax order, so logits and greedy tokens must be identical."""

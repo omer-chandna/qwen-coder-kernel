@@ -1,6 +1,8 @@
 # Plan: 8-bit KV cache (bigger context window)
 
-Status: not started. The working repo is `C:\Users\OmerC\qwen-coder-kernel` (GitHub `omer-chandna/qwen-coder-kernel`),
+Status: done (opt-in, `--kv8`); results in `docs/QWEN38_9B.md`, section "8-bit KV cache". Original plan below.
+
+Previous status: not started. The working repo is `C:\Users\OmerC\qwen-coder-kernel` (GitHub `omer-chandna/qwen-coder-kernel`),
 branch `main`. Do not push to kernel-sanders. Ask before any GPU use (model loads, benchmarks, tests).
 
 ## Goal
